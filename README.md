@@ -4,7 +4,7 @@ A Rust implementation of LyCORIS (Lora beYond Conventional methods, Other Rank a
 
 ## Overview
 
-Eri-Lycoris brings the power of advanced LoRA algorithms to Rust, designed to work seamlessly with the [Flame](https://github.com/tracel-ai/burn) deep learning framework. This library provides efficient, memory-optimized implementations of state-of-the-art parameter-efficient fine-tuning methods.
+Eri-Lycoris brings the power of advanced LoRA algorithms to Rust, designed to work seamlessly with the [Flame]( https://github.com/CodeAlexx/Flame) deep learning framework. This library provides efficient, memory-optimized implementations of state-of-the-art parameter-efficient fine-tuning methods.
 
 ## Key Strengths
 
