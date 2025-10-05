@@ -1,30 +1,44 @@
 /// LoHa (LoRA with Hadamard Product) Module
 ///
-/// ΔW = (w1u @ w1d) ⊙ (w2u @ w2d) * scale
+/// ΔW = (w1a @ w1b) ⊙ (w2a @ w2b) * scale
 /// where ⊙ is element-wise (Hadamard) product
+///
+/// Weight layouts follow Flame contracts:
+/// - Linear: [IN, OUT]
+/// - Conv2d: [KH, KW, IC, OC]
 
 use crate::{tensor_utils, Error, LycorisModule, Result};
 use cudarc::driver::CudaDevice;
-use flame_core::{ Shape, Tensor};
+use flame_core::{DType, Shape, Tensor};
 use std::sync::Arc;
 
 pub struct LoHaModule {
-    /// Down weight 1 (rank × in_dim), BF16 storage
-    pub w1d: Tensor,
+    /// First down projection (w1a)
+    /// Linear: [IN, RANK], Conv: [KH, KW, IC, RANK] or [1, 1, IC, RANK]
+    /// BF16 storage
+    pub w1a: Tensor,
 
-    /// Up weight 1 (out_dim × rank), BF16 storage
-    pub w1u: Tensor,
+    /// First up projection (w1b)
+    /// Linear: [RANK, OUT], Conv: [KH, KW, RANK, OC] or [1, 1, RANK, OC]
+    /// BF16 storage
+    pub w1b: Tensor,
 
-    /// Down weight 2 (rank × in_dim), BF16 storage
-    pub w2d: Tensor,
+    /// Second down projection (w2a)
+    /// Linear: [IN, RANK], Conv: [KH, KW, IC, RANK] or [1, 1, IC, RANK]
+    /// BF16 storage
+    pub w2a: Tensor,
 
-    /// Up weight 2 (out_dim × rank), BF16 storage
-    pub w2u: Tensor,
+    /// Second up projection (w2b)
+    /// Linear: [RANK, OUT], Conv: [KH, KW, RANK, OC] or [1, 1, RANK, OC]
+    /// BF16 storage
+    pub w2b: Tensor,
 
-    /// Tucker core 1 (rank × rank × kernel_h × kernel_w), Optional, BF16
+    /// Tucker core 1 (optional): [KH, KW, RANK, RANK]
+    /// BF16 storage
     pub t1: Option<Tensor>,
 
-    /// Tucker core 2 (rank × rank × kernel_h × kernel_w), Optional, BF16
+    /// Tucker core 2 (optional): [KH, KW, RANK, RANK]
+    /// BF16 storage
     pub t2: Option<Tensor>,
 
     /// Rank of the decomposition
@@ -38,6 +52,19 @@ pub struct LoHaModule {
 
     /// Whether this is for a convolution layer
     pub is_conv: bool,
+}
+
+// Helper functions
+#[inline]
+fn assert_bf16_storage(name: &str, t: &Tensor) -> Result<()> {
+    if t.dtype() != DType::BF16 {
+        return Err(Error::InvalidOperation(format!(
+            "{} must use BF16 storage, got {:?}",
+            name,
+            t.dtype()
+        )));
+    }
+    Ok(())
 }
 
 impl LoHaModule {
@@ -58,45 +85,46 @@ impl LoHaModule {
     ) -> Result<Self> {
         let alpha = alpha.unwrap_or(rank as f32);
 
-        // w1d: (rank, in_features), initialized with normal(0, 1)
-        let w1d = tensor_utils::randn_bf16(
-            Shape::from_dims(&[rank, in_features]),
+        // w1a: [IN, RANK], initialized with normal(0, 1)
+        let w1a = tensor_utils::randn_bf16(
+            Shape::from_dims(&[in_features, rank]),
             0.0,
             1.0,
             device.clone(),
-        )
-        .map_err(|e| Error::Flame(e))?;
+        )?;
 
-        // w1u: (out_features, rank), initialized with zeros
-        let w1u = tensor_utils::zeros_bf16(
-            Shape::from_dims(&[out_features, rank]),
+        // w1b: [RANK, OUT], initialized with zeros
+        let w1b = tensor_utils::zeros_bf16(
+            Shape::from_dims(&[rank, out_features]),
             device.clone(),
-        )
-        .map_err(|e| Error::Flame(e))?;
+        )?;
 
-        // w2d: (rank, in_features), initialized with normal(0, 1)
-        let w2d = tensor_utils::randn_bf16(
-            Shape::from_dims(&[rank, in_features]),
+        // w2a: [IN, RANK], initialized with normal(0, 1)
+        let w2a = tensor_utils::randn_bf16(
+            Shape::from_dims(&[in_features, rank]),
             0.0,
             1.0,
             device.clone(),
-        )
-        .map_err(|e| Error::Flame(e))?;
+        )?;
 
-        // w2u: (out_features, rank), initialized with normal(0, 0.1)
-        let w2u = tensor_utils::randn_bf16(
-            Shape::from_dims(&[out_features, rank]),
+        // w2b: [RANK, OUT], initialized with normal(0, 0.1)
+        let w2b = tensor_utils::randn_bf16(
+            Shape::from_dims(&[rank, out_features]),
             0.0,
             0.1,
             device.clone(),
-        )
-        .map_err(|e| Error::Flame(e))?;
+        )?;
+
+        assert_bf16_storage("w1a", &w1a)?;
+        assert_bf16_storage("w1b", &w1b)?;
+        assert_bf16_storage("w2a", &w2a)?;
+        assert_bf16_storage("w2b", &w2b)?;
 
         Ok(Self {
-            w1d,
-            w1u,
-            w2d,
-            w2u,
+            w1a,
+            w1b,
+            w2a,
+            w2b,
             t1: None,
             t2: None,
             rank,
@@ -128,182 +156,352 @@ impl LoHaModule {
         let alpha = alpha.unwrap_or(rank as f32);
         let (kh, kw) = kernel_size;
 
-        if use_tucker && (kh > 1 || kw > 1) {
-            // Tucker decomposition path
-            // w1d, w2d: (rank, in_channels)
-            let w1d = tensor_utils::randn_bf16(
-                Shape::from_dims(&[rank, in_channels]),
+        // Follow Flame conv layout: [KH, KW, IC, OC]
+        let (w1a, w1b, w2a, w2b, t1, t2) = if kh == 1 && kw == 1 {
+            // 1×1 convolution
+            let w1a = tensor_utils::randn_bf16(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
                 0.0,
                 1.0,
                 device.clone(),
-            )
-            .map_err(|e| Error::Flame(e))?;
-
-            let w2d = tensor_utils::randn_bf16(
-                Shape::from_dims(&[rank, in_channels]),
+            )?;
+            let w1b = tensor_utils::zeros_bf16(
+                Shape::from_dims(&[1, 1, rank, out_channels]),
+                device.clone(),
+            )?;
+            let w2a = tensor_utils::randn_bf16(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
                 0.0,
                 1.0,
                 device.clone(),
-            )
-            .map_err(|e| Error::Flame(e))?;
-
-            // w1u, w2u: (rank, out_channels)
-            let w1u = tensor_utils::zeros_bf16(
-                Shape::from_dims(&[rank, out_channels]),
-                device.clone(),
-            )
-            .map_err(|e| Error::Flame(e))?;
-
-            let w2u = tensor_utils::randn_bf16(
-                Shape::from_dims(&[rank, out_channels]),
+            )?;
+            let w2b = tensor_utils::randn_bf16(
+                Shape::from_dims(&[1, 1, rank, out_channels]),
                 0.0,
                 0.1,
                 device.clone(),
-            )
-            .map_err(|e| Error::Flame(e))?;
+            )?;
+            (w1a, w1b, w2a, w2b, None, None)
+        } else if use_tucker {
+            // Tucker decomposition: spatial kernels in t1/t2
+            let w1a = tensor_utils::randn_bf16(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
+                0.0,
+                1.0,
+                device.clone(),
+            )?;
+            let w1b = tensor_utils::zeros_bf16(
+                Shape::from_dims(&[1, 1, rank, out_channels]),
+                device.clone(),
+            )?;
+            let w2a = tensor_utils::randn_bf16(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
+                0.0,
+                1.0,
+                device.clone(),
+            )?;
+            let w2b = tensor_utils::randn_bf16(
+                Shape::from_dims(&[1, 1, rank, out_channels]),
+                0.0,
+                0.1,
+                device.clone(),
+            )?;
 
-            // t1, t2: (rank, rank, kh, kw)
             let t1 = tensor_utils::randn_bf16(
-                Shape::from_dims(&[rank, rank, kh, kw]),
+                Shape::from_dims(&[kh, kw, rank, rank]),
                 0.0,
                 0.1,
                 device.clone(),
-            )
-            .map_err(|e| Error::Flame(e))?;
-
+            )?;
             let t2 = tensor_utils::randn_bf16(
-                Shape::from_dims(&[rank, rank, kh, kw]),
+                Shape::from_dims(&[kh, kw, rank, rank]),
                 0.0,
                 0.1,
                 device.clone(),
-            )
-            .map_err(|e| Error::Flame(e))?;
+            )?;
 
-            Ok(Self {
-                w1d,
-                w1u,
-                w2d,
-                w2u,
-                t1: Some(t1),
-                t2: Some(t2),
-                rank,
-                alpha,
-                device,
-                is_conv: true,
-            })
+            (w1a, w1b, w2a, w2b, Some(t1), Some(t2))
         } else {
-            // Standard path (no Tucker)
-            let w1d = tensor_utils::randn_bf16(
-                Shape::from_dims(&[rank, in_channels]),
+            // Standard spatial convolution
+            let w1a = tensor_utils::randn_bf16(
+                Shape::from_dims(&[kh, kw, in_channels, rank]),
                 0.0,
                 1.0,
                 device.clone(),
-            )
-            .map_err(|e| Error::Flame(e))?;
-
-            let w1u = tensor_utils::zeros_bf16(
-                Shape::from_dims(&[out_channels, rank]),
+            )?;
+            let w1b = tensor_utils::zeros_bf16(
+                Shape::from_dims(&[kh, kw, rank, out_channels]),
                 device.clone(),
-            )
-            .map_err(|e| Error::Flame(e))?;
-
-            let w2d = tensor_utils::randn_bf16(
-                Shape::from_dims(&[rank, in_channels]),
+            )?;
+            let w2a = tensor_utils::randn_bf16(
+                Shape::from_dims(&[kh, kw, in_channels, rank]),
                 0.0,
                 1.0,
                 device.clone(),
-            )
-            .map_err(|e| Error::Flame(e))?;
-
-            let w2u = tensor_utils::randn_bf16(
-                Shape::from_dims(&[out_channels, rank]),
+            )?;
+            let w2b = tensor_utils::randn_bf16(
+                Shape::from_dims(&[kh, kw, rank, out_channels]),
                 0.0,
                 0.1,
                 device.clone(),
-            )
-            .map_err(|e| Error::Flame(e))?;
+            )?;
+            (w1a, w1b, w2a, w2b, None, None)
+        };
 
-            Ok(Self {
-                w1d,
-                w1u,
-                w2d,
-                w2u,
-                t1: None,
-                t2: None,
-                rank,
-                alpha,
-                device,
-                is_conv: false,
-            })
+        assert_bf16_storage("w1a", &w1a)?;
+        assert_bf16_storage("w1b", &w1b)?;
+        assert_bf16_storage("w2a", &w2a)?;
+        assert_bf16_storage("w2b", &w2b)?;
+        if let Some(ref t) = t1 {
+            assert_bf16_storage("t1", t)?;
+        }
+        if let Some(ref t) = t2 {
+            assert_bf16_storage("t2", t)?;
+        }
+
+        Ok(Self {
+            w1a,
+            w1b,
+            w2a,
+            w2b,
+            t1,
+            t2,
+            rank,
+            alpha,
+            device,
+            is_conv: true,
+        })
+    }
+
+    /// Get the scaling factor (alpha / rank), returns 0.0 if rank==0
+    #[inline]
+    pub fn scale(&self) -> f32 {
+        if self.rank == 0 {
+            0.0
+        } else {
+            self.alpha / self.rank as f32
         }
     }
 
-    /// Get the scaling factor (alpha / rank)
-    pub fn scale(&self) -> f32 {
-        self.alpha / self.rank as f32
+    /// Merge into base weight tensor
+    pub fn merge_into(&self, base_weight: &mut Tensor, multiplier: f32) -> Result<()> {
+        let delta = self
+            .get_diff_weight()?
+            .mul_scalar(multiplier)
+            .map_err(Error::Flame)?;
+        // In-place add: base += delta
+        base_weight.add_inplace(&delta).map_err(Error::Flame)
     }
 }
 
 impl LycorisModule for LoHaModule {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Python source: bypass_forward_diff builds diff_weight and applies via FUNC_LIST
-        // For linear: FUNC_LIST[2] = F.linear
-        // For conv: FUNC_LIST[4] = F.conv2d
+        let scale = self.scale();
 
-        // Build the differential weight
-        let diff_w = self.get_diff_weight()?;
+        // Early exit for zero rank
+        if scale == 0.0 {
+            return tensor_utils::zeros_bf16(Shape::from_dims(x.dims()), self.device.clone())
+                .map_err(Error::Flame);
+        }
 
-        // Apply based on layer type
+        // Compute w1 and w2 with proper operations
         if self.is_conv {
-            // For Conv2d, would use conv2d operation
-            // For now, simplified linear application
-            let diff_w_t = crate::tensor_utils::transpose_2d(&diff_w)?;
-            x.matmul(&diff_w_t).map_err(|e| Error::Flame(e))
+            // Conv path: use conv2d operations
+            let h1 = if let Some(ref t1) = self.t1 {
+                // Tucker: w1a → t1 → w1b
+                let temp = crate::ops::conv2d::conv2d(
+                    x,
+                    &self.w1a,
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                    crate::ops::conv2d::Layout::NHWC,
+                )
+                .map_err(Error::Flame)?;
+                let temp = crate::ops::conv2d::conv2d(
+                    &temp,
+                    t1,
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                    crate::ops::conv2d::Layout::NHWC,
+                )
+                .map_err(Error::Flame)?;
+                crate::ops::conv2d::conv2d(
+                    &temp,
+                    &self.w1b,
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                    crate::ops::conv2d::Layout::NHWC,
+                )
+                .map_err(Error::Flame)?
+            } else {
+                // Direct: w1a → w1b
+                let temp = crate::ops::conv2d::conv2d(
+                    x,
+                    &self.w1a,
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                    crate::ops::conv2d::Layout::NHWC,
+                )
+                .map_err(Error::Flame)?;
+                crate::ops::conv2d::conv2d(
+                    &temp,
+                    &self.w1b,
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                    crate::ops::conv2d::Layout::NHWC,
+                )
+                .map_err(Error::Flame)?
+            };
+
+            let h2 = if let Some(ref t2) = self.t2 {
+                // Tucker: w2a → t2 → w2b
+                let temp = crate::ops::conv2d::conv2d(
+                    x,
+                    &self.w2a,
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                    crate::ops::conv2d::Layout::NHWC,
+                )
+                .map_err(Error::Flame)?;
+                let temp = crate::ops::conv2d::conv2d(
+                    &temp,
+                    t2,
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                    crate::ops::conv2d::Layout::NHWC,
+                )
+                .map_err(Error::Flame)?;
+                crate::ops::conv2d::conv2d(
+                    &temp,
+                    &self.w2b,
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                    crate::ops::conv2d::Layout::NHWC,
+                )
+                .map_err(Error::Flame)?
+            } else {
+                // Direct: w2a → w2b
+                let temp = crate::ops::conv2d::conv2d(
+                    x,
+                    &self.w2a,
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                    crate::ops::conv2d::Layout::NHWC,
+                )
+                .map_err(Error::Flame)?;
+                crate::ops::conv2d::conv2d(
+                    &temp,
+                    &self.w2b,
+                    (1, 1),
+                    (0, 0),
+                    (1, 1),
+                    1,
+                    crate::ops::conv2d::Layout::NHWC,
+                )
+                .map_err(Error::Flame)?
+            };
+
+            // Hadamard product and scale
+            let result = h1.mul(&h2).map_err(Error::Flame)?;
+            result.mul_scalar(scale).map_err(Error::Flame)
         } else {
-            // Linear layer: x @ diff_w^T
-            let diff_w_t = crate::tensor_utils::transpose_2d(&diff_w)?;
-            x.matmul(&diff_w_t).map_err(|e| Error::Flame(e))
+            // Linear path: w1 = w1a @ w1b, w2 = w2a @ w2b
+            let w1 = self.w1a.matmul(&self.w1b).map_err(Error::Flame)?;
+            let w2 = self.w2a.matmul(&self.w2b).map_err(Error::Flame)?;
+
+            // Hadamard product
+            let diff_w = w1.mul(&w2).map_err(Error::Flame)?;
+            let scaled_diff = diff_w.mul_scalar(scale).map_err(Error::Flame)?;
+
+            // Apply to input: x @ diff_w
+            x.matmul(&scaled_diff).map_err(Error::Flame)
         }
     }
 
     fn get_diff_weight(&self) -> Result<Tensor> {
-        // Compute ΔW = (w1u @ w1d) ⊙ (w2u @ w2d) * scale
         let scale = self.scale();
 
-        if self.t1.is_some() && self.t2.is_some() {
-            // Tucker decomposition path
-            crate::ops::hadamard::make_hadamard_weight_tucker(
-                self.t1.as_ref().unwrap(),
-                &self.w1d,
-                &self.w1u,
-                self.t2.as_ref().unwrap(),
-                &self.w2d,
-                &self.w2u,
-                scale,
-            )
+        // Early exit for zero scale
+        if scale == 0.0 {
+            return if self.is_conv {
+                tensor_utils::zeros_bf16(self.w1b.shape().clone(), self.device.clone())
+                    .map_err(Error::Flame)
+            } else {
+                tensor_utils::zeros_bf16(
+                    Shape::from_dims(&[self.w1a.dims()[0], self.w1b.dims()[1]]),
+                    self.device.clone(),
+                )
+                .map_err(Error::Flame)
+            };
+        }
+
+        if self.is_conv {
+            // Conv path
+            if let (Some(ref t1), Some(ref t2)) = (&self.t1, &self.t2) {
+                // Tucker path: need full reconstruction
+                // For now, use simplified approach via hadamard op
+                crate::ops::hadamard::make_hadamard_weight_tucker(
+                    t1, &self.w1a, &self.w1b, t2, &self.w2a, &self.w2b, scale,
+                )
+            } else {
+                // Standard conv: compute kernel via hadamard
+                let dims = self.w1a.dims();
+                if dims[0] == 1 && dims[1] == 1 {
+                    // 1×1 case: can use linear math
+                    let ic = dims[2];
+                    let r = dims[3];
+                    let oc = self.w1b.dims()[3];
+
+                    let w1a_lin = self.w1a.reshape(&[ic, r]).map_err(Error::Flame)?;
+                    let w1b_lin = self.w1b.reshape(&[r, oc]).map_err(Error::Flame)?;
+                    let w2a_lin = self.w2a.reshape(&[ic, r]).map_err(Error::Flame)?;
+                    let w2b_lin = self.w2b.reshape(&[r, oc]).map_err(Error::Flame)?;
+
+                    let w1 = w1a_lin.matmul(&w1b_lin).map_err(Error::Flame)?;
+                    let w2 = w2a_lin.matmul(&w2b_lin).map_err(Error::Flame)?;
+                    let diff = w1.mul(&w2).map_err(Error::Flame)?;
+                    let k = diff.reshape(&[1, 1, ic, oc]).map_err(Error::Flame)?;
+                    k.mul_scalar(scale).map_err(Error::Flame)
+                } else {
+                    // Spatial case: use hadamard op
+                    crate::ops::hadamard::make_hadamard_weight(
+                        &self.w1a, &self.w1b, &self.w2a, &self.w2b, scale,
+                    )
+                }
+            }
         } else {
-            // Standard Hadamard path
-            crate::ops::hadamard::make_hadamard_weight(
-                &self.w1d,
-                &self.w1u,
-                &self.w2d,
-                &self.w2u,
-                scale,
-            )
+            // Linear: w1 = w1a @ w1b, w2 = w2a @ w2b, diff = w1 ⊙ w2
+            let w1 = self.w1a.matmul(&self.w1b).map_err(Error::Flame)?;
+            let w2 = self.w2a.matmul(&self.w2b).map_err(Error::Flame)?;
+            let diff = w1.mul(&w2).map_err(Error::Flame)?;
+            diff.mul_scalar(scale).map_err(Error::Flame)
         }
     }
 
     fn merge_to(&mut self, multiplier: f32) -> Result<()> {
-        // Get differential weight
-        let diff_weight = self.get_diff_weight()?;
-
-        // Scale by multiplier
-        let _scaled_diff = diff_weight.mul_scalar(multiplier)
-            .map_err(|e| Error::Flame(e))?;
-
-        // In a real implementation, merge with base weight
-        // base_weight = base_weight + scaled_diff
-
+        // Deprecated in favor of merge_into()
+        let _scaled = self
+            .get_diff_weight()?
+            .mul_scalar(multiplier)
+            .map_err(Error::Flame)?;
         Ok(())
     }
 }
@@ -316,5 +514,24 @@ mod tests {
     fn test_loha_creation() {
         // Placeholder - requires CUDA device initialization
         assert!(true);
+    }
+
+    #[test]
+    fn test_scale_zero_rank() {
+        let device = Arc::new(CudaDevice::new(0).unwrap());
+        let module = LoHaModule {
+            w1a: tensor_utils::zeros_bf16(Shape::from_dims(&[4, 0]), device.clone()).unwrap(),
+            w1b: tensor_utils::zeros_bf16(Shape::from_dims(&[0, 8]), device.clone()).unwrap(),
+            w2a: tensor_utils::zeros_bf16(Shape::from_dims(&[4, 0]), device.clone()).unwrap(),
+            w2b: tensor_utils::zeros_bf16(Shape::from_dims(&[0, 8]), device.clone()).unwrap(),
+            t1: None,
+            t2: None,
+            rank: 0,
+            alpha: 1.0,
+            device,
+            is_conv: false,
+        };
+
+        assert_eq!(module.scale(), 0.0);
     }
 }
