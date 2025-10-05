@@ -217,13 +217,15 @@ impl LoConModule {
     }
 
     /// Merge into base weight tensor
-    pub fn merge_into(&self, base_weight: &mut Tensor, multiplier: f32) -> Result<()> {
+    ///
+    /// Returns new merged tensor (Flame doesn't support in-place add)
+    pub fn merge_into(&self, base_weight: &Tensor, multiplier: f32) -> Result<Tensor> {
         let delta = self
             .get_diff_weight()?
             .mul_scalar(multiplier)
             .map_err(Error::Flame)?;
-        // In-place add: base += delta
-        base_weight.add_inplace(&delta).map_err(Error::Flame)
+        // Add: result = base + delta
+        base_weight.add(&delta).map_err(Error::Flame)
     }
 }
 
@@ -236,8 +238,7 @@ impl LycorisModule for LoConModule {
             return tensor_utils::zeros_bf16(
                 Shape::from_dims(x.dims()),
                 self.device.clone(),
-            )
-            .map_err(Error::Flame);
+            );
         }
 
         // First apply down projection (BF16 -> FP32 compute -> BF16 output)
@@ -252,8 +253,7 @@ impl LycorisModule for LoConModule {
                 /*dilation=*/ (1, 1),
                 /*groups=*/ 1,
                 /*layout=*/ crate::ops::conv2d::Layout::NHWC,
-            )
-            .map_err(Error::Flame)?
+            )?
         } else {
             // Linear operation: x[..., IN] @ down[IN, RANK] -> [..., RANK]
             x.matmul(&self.down).map_err(Error::Flame)?
@@ -270,8 +270,7 @@ impl LycorisModule for LoConModule {
                 (1, 1),
                 1,
                 crate::ops::conv2d::Layout::NHWC,
-            )
-            .map_err(Error::Flame)?
+            )?
         } else {
             h
         };
@@ -287,8 +286,7 @@ impl LycorisModule for LoConModule {
                 (1, 1),
                 1,
                 crate::ops::conv2d::Layout::NHWC,
-            )
-            .map_err(Error::Flame)?
+            )?
         } else {
             // h[..., RANK] @ up[RANK, OUT] -> [..., OUT]
             h.matmul(&self.up).map_err(Error::Flame)?
@@ -308,13 +306,11 @@ impl LycorisModule for LoConModule {
                     self.up.shape().clone(),
                     self.device.clone(),
                 )
-                .map_err(Error::Flame)
             } else {
                 tensor_utils::zeros_bf16(
                     Shape::from_dims(&[self.down.dims()[0], self.up.dims()[1]]),
                     self.device.clone(),
                 )
-                .map_err(Error::Flame)
             };
         }
 

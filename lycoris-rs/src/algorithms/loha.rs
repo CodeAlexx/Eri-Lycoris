@@ -284,13 +284,15 @@ impl LoHaModule {
     }
 
     /// Merge into base weight tensor
-    pub fn merge_into(&self, base_weight: &mut Tensor, multiplier: f32) -> Result<()> {
+    ///
+    /// Returns new merged tensor (Flame doesn't support in-place add)
+    pub fn merge_into(&self, base_weight: &Tensor, multiplier: f32) -> Result<Tensor> {
         let delta = self
             .get_diff_weight()?
             .mul_scalar(multiplier)
             .map_err(Error::Flame)?;
-        // In-place add: base += delta
-        base_weight.add_inplace(&delta).map_err(Error::Flame)
+        // Add: result = base + delta
+        base_weight.add(&delta).map_err(Error::Flame)
     }
 }
 
@@ -300,8 +302,7 @@ impl LycorisModule for LoHaModule {
 
         // Early exit for zero rank
         if scale == 0.0 {
-            return tensor_utils::zeros_bf16(Shape::from_dims(x.dims()), self.device.clone())
-                .map_err(Error::Flame);
+            return tensor_utils::zeros_bf16(Shape::from_dims(x.dims()), self.device.clone());
         }
 
         // Compute w1 and w2 with proper operations
@@ -318,7 +319,7 @@ impl LycorisModule for LoHaModule {
                     1,
                     crate::ops::conv2d::Layout::NHWC,
                 )
-                .map_err(Error::Flame)?;
+                ?;
                 let temp = crate::ops::conv2d::conv2d(
                     &temp,
                     t1,
@@ -328,7 +329,7 @@ impl LycorisModule for LoHaModule {
                     1,
                     crate::ops::conv2d::Layout::NHWC,
                 )
-                .map_err(Error::Flame)?;
+                ?;
                 crate::ops::conv2d::conv2d(
                     &temp,
                     &self.w1b,
@@ -338,7 +339,7 @@ impl LycorisModule for LoHaModule {
                     1,
                     crate::ops::conv2d::Layout::NHWC,
                 )
-                .map_err(Error::Flame)?
+                ?
             } else {
                 // Direct: w1a → w1b
                 let temp = crate::ops::conv2d::conv2d(
@@ -350,7 +351,7 @@ impl LycorisModule for LoHaModule {
                     1,
                     crate::ops::conv2d::Layout::NHWC,
                 )
-                .map_err(Error::Flame)?;
+                ?;
                 crate::ops::conv2d::conv2d(
                     &temp,
                     &self.w1b,
@@ -360,7 +361,7 @@ impl LycorisModule for LoHaModule {
                     1,
                     crate::ops::conv2d::Layout::NHWC,
                 )
-                .map_err(Error::Flame)?
+                ?
             };
 
             let h2 = if let Some(ref t2) = self.t2 {
@@ -374,7 +375,7 @@ impl LycorisModule for LoHaModule {
                     1,
                     crate::ops::conv2d::Layout::NHWC,
                 )
-                .map_err(Error::Flame)?;
+                ?;
                 let temp = crate::ops::conv2d::conv2d(
                     &temp,
                     t2,
@@ -384,7 +385,7 @@ impl LycorisModule for LoHaModule {
                     1,
                     crate::ops::conv2d::Layout::NHWC,
                 )
-                .map_err(Error::Flame)?;
+                ?;
                 crate::ops::conv2d::conv2d(
                     &temp,
                     &self.w2b,
@@ -394,7 +395,7 @@ impl LycorisModule for LoHaModule {
                     1,
                     crate::ops::conv2d::Layout::NHWC,
                 )
-                .map_err(Error::Flame)?
+                ?
             } else {
                 // Direct: w2a → w2b
                 let temp = crate::ops::conv2d::conv2d(
@@ -406,7 +407,7 @@ impl LycorisModule for LoHaModule {
                     1,
                     crate::ops::conv2d::Layout::NHWC,
                 )
-                .map_err(Error::Flame)?;
+                ?;
                 crate::ops::conv2d::conv2d(
                     &temp,
                     &self.w2b,
@@ -416,20 +417,20 @@ impl LycorisModule for LoHaModule {
                     1,
                     crate::ops::conv2d::Layout::NHWC,
                 )
-                .map_err(Error::Flame)?
+                ?
             };
 
             // Hadamard product and scale
-            let result = h1.mul(&h2).map_err(Error::Flame)?;
+            let result = h1.mul(&h2)?;
             result.mul_scalar(scale).map_err(Error::Flame)
         } else {
             // Linear path: w1 = w1a @ w1b, w2 = w2a @ w2b
-            let w1 = self.w1a.matmul(&self.w1b).map_err(Error::Flame)?;
-            let w2 = self.w2a.matmul(&self.w2b).map_err(Error::Flame)?;
+            let w1 = self.w1a.matmul(&self.w1b)?;
+            let w2 = self.w2a.matmul(&self.w2b)?;
 
             // Hadamard product
-            let diff_w = w1.mul(&w2).map_err(Error::Flame)?;
-            let scaled_diff = diff_w.mul_scalar(scale).map_err(Error::Flame)?;
+            let diff_w = w1.mul(&w2)?;
+            let scaled_diff = diff_w.mul_scalar(scale)?;
 
             // Apply to input: x @ diff_w
             x.matmul(&scaled_diff).map_err(Error::Flame)
@@ -443,13 +444,11 @@ impl LycorisModule for LoHaModule {
         if scale == 0.0 {
             return if self.is_conv {
                 tensor_utils::zeros_bf16(self.w1b.shape().clone(), self.device.clone())
-                    .map_err(Error::Flame)
             } else {
                 tensor_utils::zeros_bf16(
                     Shape::from_dims(&[self.w1a.dims()[0], self.w1b.dims()[1]]),
                     self.device.clone(),
                 )
-                .map_err(Error::Flame)
             };
         }
 
@@ -470,15 +469,15 @@ impl LycorisModule for LoHaModule {
                     let r = dims[3];
                     let oc = self.w1b.dims()[3];
 
-                    let w1a_lin = self.w1a.reshape(&[ic, r]).map_err(Error::Flame)?;
-                    let w1b_lin = self.w1b.reshape(&[r, oc]).map_err(Error::Flame)?;
-                    let w2a_lin = self.w2a.reshape(&[ic, r]).map_err(Error::Flame)?;
-                    let w2b_lin = self.w2b.reshape(&[r, oc]).map_err(Error::Flame)?;
+                    let w1a_lin = self.w1a.reshape(&[ic, r])?;
+                    let w1b_lin = self.w1b.reshape(&[r, oc])?;
+                    let w2a_lin = self.w2a.reshape(&[ic, r])?;
+                    let w2b_lin = self.w2b.reshape(&[r, oc])?;
 
-                    let w1 = w1a_lin.matmul(&w1b_lin).map_err(Error::Flame)?;
-                    let w2 = w2a_lin.matmul(&w2b_lin).map_err(Error::Flame)?;
-                    let diff = w1.mul(&w2).map_err(Error::Flame)?;
-                    let k = diff.reshape(&[1, 1, ic, oc]).map_err(Error::Flame)?;
+                    let w1 = w1a_lin.matmul(&w1b_lin)?;
+                    let w2 = w2a_lin.matmul(&w2b_lin)?;
+                    let diff = w1.mul(&w2)?;
+                    let k = diff.reshape(&[1, 1, ic, oc])?;
                     k.mul_scalar(scale).map_err(Error::Flame)
                 } else {
                     // Spatial case: use hadamard op
@@ -489,9 +488,9 @@ impl LycorisModule for LoHaModule {
             }
         } else {
             // Linear: w1 = w1a @ w1b, w2 = w2a @ w2b, diff = w1 ⊙ w2
-            let w1 = self.w1a.matmul(&self.w1b).map_err(Error::Flame)?;
-            let w2 = self.w2a.matmul(&self.w2b).map_err(Error::Flame)?;
-            let diff = w1.mul(&w2).map_err(Error::Flame)?;
+            let w1 = self.w1a.matmul(&self.w1b)?;
+            let w2 = self.w2a.matmul(&self.w2b)?;
+            let diff = w1.mul(&w2)?;
             diff.mul_scalar(scale).map_err(Error::Flame)
         }
     }
