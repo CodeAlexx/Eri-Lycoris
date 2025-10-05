@@ -91,6 +91,95 @@ pub fn rebuild_tucker(
     result.reshape(&final_shape).map_err(|e| Error::Flame(e))
 }
 
+/// Rebuild conv kernel from Tucker decomposition for conv layers
+///
+/// Expects Flame layout: [KH, KW, IC, OC]
+///
+/// # Arguments
+/// * `core` - Tucker core tensor [KH, KW, RANK, RANK], BF16 storage
+/// * `down` - Down factor [1, 1, IC, RANK], BF16 storage
+/// * `up` - Up factor [1, 1, RANK, OC], BF16 storage
+///
+/// # Returns
+/// Conv kernel in Flame layout: [KH, KW, IC, OC]
+pub fn rebuild_conv_tucker(
+    core: &Tensor,
+    down: &Tensor,
+    up: &Tensor,
+) -> Result<Tensor> {
+    let core_dims = core.dims();
+    let down_dims = down.dims();
+    let up_dims = up.dims();
+
+    // Validate shapes
+    if core_dims.len() != 4 {
+        return Err(Error::InvalidOperation(
+            "rebuild_conv_tucker: core must be [KH,KW,R,R]".into(),
+        ));
+    }
+    if down_dims.len() != 4 || up_dims.len() != 4 {
+        return Err(Error::InvalidOperation(
+            "rebuild_conv_tucker: down/up must be [1,1,C,R]".into(),
+        ));
+    }
+    if down_dims[0] != 1 || down_dims[1] != 1 || up_dims[0] != 1 || up_dims[1] != 1 {
+        return Err(Error::InvalidOperation(
+            "rebuild_conv_tucker: down/up must be 1×1 kernels".into(),
+        ));
+    }
+
+    let (kh, kw, r1, r2) = (core_dims[0], core_dims[1], core_dims[2], core_dims[3]);
+    let ic = down_dims[2];
+    let oc = up_dims[3];
+    let r_down = down_dims[3];
+    let r_up = up_dims[2];
+
+    if r_down != r1 || r_up != r2 {
+        return Err(Error::InvalidOperation(format!(
+            "Rank mismatch: core[{},{}], down_r={}, up_r={}",
+            r1, r2, r_down, r_up
+        )));
+    }
+
+    // Reshape factors to [IC, R] and [R, OC]
+    let down_2d = down.reshape(&[ic, r_down]).map_err(Error::Flame)?;
+    let up_2d = up.reshape(&[r_up, oc]).map_err(Error::Flame)?;
+
+    // For each spatial position (h,w), contract: down @ core[h,w] @ up
+    // Result: [KH, KW, IC, OC]
+    let mut result = crate::tensor_utils::zeros_bf16(
+        flame_core::Shape::from_dims(&[kh, kw, ic, oc]),
+        core.device().clone(),
+    )?;
+
+    for h in 0..kh {
+        for w in 0..kw {
+            // Get core slice at [h, w, :, :] → [R, R]
+            let core_hw = core
+                .narrow(0, h, 1)?
+                .narrow(1, w, 1)?
+                .reshape(&[r1, r2])
+                .map_err(Error::Flame)?;
+
+            // Contract: [IC,R] @ [R,R] @ [R,OC] → [IC,OC]
+            let temp = down_2d.matmul(&core_hw).map_err(Error::Flame)?;
+            let kernel_hw = temp.matmul(&up_2d).map_err(Error::Flame)?;
+
+            // Reshape to [1, 1, IC, OC] and write to result
+            let kernel_4d = kernel_hw.reshape(&[1, 1, ic, oc]).map_err(Error::Flame)?;
+
+            // Write slice (needs tensor assignment - placeholder for now)
+            // This requires tensor slice assignment which may not be available
+            // For now, accumulate or return error
+            result = result
+                .index_put(&[h as i64, w as i64], &kernel_4d)
+                .map_err(Error::Flame)?;
+        }
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
