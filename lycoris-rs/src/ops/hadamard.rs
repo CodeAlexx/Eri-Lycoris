@@ -54,15 +54,13 @@ pub fn make_hadamard_weight(
             return crate::tensor_utils::zeros_bf16(
                 flame_core::Shape::from_dims(&[dims[0], w1b.dims()[1]]),
                 w1a.device().clone(),
-            )
-            .map_err(Error::Flame);
+            );
         } else {
             // Conv: same shape as w1b
             return crate::tensor_utils::zeros_bf16(
                 w1b.shape().clone(),
                 w1a.device().clone(),
-            )
-            .map_err(Error::Flame);
+            );
         }
     }
 
@@ -143,8 +141,7 @@ pub fn make_hadamard_weight_tucker(
         return crate::tensor_utils::zeros_bf16(
             t1.shape().clone(),
             t1.device().clone(),
-        )
-        .map_err(Error::Flame);
+        );
     }
 
     // Tucker reconstruction requires proper tensor contraction

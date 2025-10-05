@@ -1,630 +1,185 @@
-/// LoKr (LoRA with Kronecker Product) Module
-///
-/// ΔW = w1 ⊗ w2 * scale
-/// where ⊗ is the Kronecker product
-///
-/// With optional factorization:
-/// ΔW = (w1a @ w1b) ⊗ (w2a @ w2b) * scale
+//! LoKr (Kronecker LoRA)
+//! Linear ΔW = kron(W1, W2) * scale  → [IN,OUT]
+//! Conv   ΔK = kron(W1:[OL,IM], W2_full:[OK,IN,KH,KW]) * scale  → [KH,KW,IC,OC]
+//! Public layouts: Linear [IN,OUT], Conv kernel [KH,KW,IC,OC] (NHWC runtime)
 
-use crate::{tensor_utils, Error, LycorisModule, Result};
+use crate::{Error, LycorisModule, Result};
+use crate::ops::kronecker::{make_kronecker, make_kronecker_conv_kernel};
+use crate::ops::tucker::rebuild_conv_tucker;
 use cudarc::driver::CudaDevice;
-use flame_core::{DType, Shape, Tensor};
+use flame_core::{DType, Tensor};
 use std::sync::Arc;
 
-/// Layer type for explicit conv vs linear distinction
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayerKind {
-    Linear,
-    Conv2d,
-}
-
-pub struct LoKrModule {
-    /// First Kronecker factor (full or factorized)
-    /// If decomposed: None, else (out_l × in_m), BF16
-    pub w1: Option<Tensor>,
-
-    /// First factor decomposition: w1a (out_l × rank), BF16
-    pub w1a: Option<Tensor>,
-
-    /// First factor decomposition: w1b (rank × in_m), BF16
-    pub w1b: Option<Tensor>,
-
-    /// Second Kronecker factor (full or factorized)
-    /// If decomposed: None, else (out_k × in_n × kernel...), BF16
-    pub w2: Option<Tensor>,
-
-    /// Second factor decomposition: w2a (out_k × rank), BF16
-    pub w2a: Option<Tensor>,
-
-    /// Second factor decomposition: w2b (rank × in_n × kernel...), BF16
-    pub w2b: Option<Tensor>,
-
-    /// Tucker core tensor for w2 (rank × rank × kh × kw), Optional, BF16
-    pub t2: Option<Tensor>,
-
-    /// Rank for decomposition
-    pub rank: usize,
-
-    /// Alpha parameter for scaling
-    pub alpha: f32,
-
-    /// Device
-    pub device: Arc<CudaDevice>,
-
-    /// Factorization shape: ((out_l, out_k), (in_m, in_n))
-    pub shape: ((usize, usize), (usize, usize)),
-
-    /// Kernel size for conv layers
-    pub kernel_size: Option<(usize, usize)>,
-
-    /// Explicit layer type
-    pub kind: LayerKind,
-}
-
-// Helper functions for tensor operations
+#[inline]
 fn assert_bf16_storage(name: &str, t: &Tensor) -> Result<()> {
-    let dt = t.dtype();
-    if dt != DType::BF16 {
-        return Err(Error::InvalidOperation(format!(
-            "{} must use BF16 storage, got {:?}",
-            name, dt
-        )));
+    if t.dtype() != DType::BF16 {
+        return Err(Error::InvalidOperation(format!("{name} must use BF16 storage")));
     }
     Ok(())
 }
 
-fn swap_last_two(x: &Tensor) -> Result<Tensor> {
-    let dims = x.dims();
-    let n = dims.len();
-    if n < 2 {
-        return Err(Error::InvalidOperation(
-            "swap_last_two requires at least 2 dimensions".into(),
-        ));
-    }
-    let mut order: Vec<usize> = (0..n).collect();
-    order.swap(n - 1, n - 2);
-    x.permute(&order).map_err(Error::Flame)
+#[inline]
+fn scale_from(alpha: f32, rank: usize) -> f32 {
+    if rank == 0 { 0.0 } else { alpha / rank as f32 }
 }
 
-fn move_dim_to_end(x: &Tensor, dim_idx: usize) -> Result<Tensor> {
-    let n = x.dims().len();
-    if dim_idx >= n {
-        return Err(Error::InvalidOperation(
-            "move_dim_to_end: dim out of range".into(),
-        ));
-    }
-    let mut order: Vec<usize> = (0..n).collect();
-    order.remove(dim_idx);
-    order.push(dim_idx);
-    x.permute(&order).map_err(Error::Flame)
+/// LoKr module supports either full or factorized W1/W2. For conv, W2 may be Tucker/factorized.
+pub struct LoKrModule {
+    // W1 (matrix): either full [OL,IM] or factorized [OL,R]@[R,IM]
+    pub w1:  Option<Tensor>,
+    pub w1a: Option<Tensor>,
+    pub w1b: Option<Tensor>,
+
+    // W2 (conv-style): either full [OK,IN,KH,KW], or factorized/Tucker
+    pub w2:  Option<Tensor>,   // [OK,IN,KH,KW]
+    pub w2a: Option<Tensor>,   // [OK,R]
+    pub w2b: Option<Tensor>,   // [R,IN] or [R,IN,KH,KW]
+    pub t2:  Option<Tensor>,   // [KH,KW,R,R]
+
+    pub rank: usize,
+    pub alpha: f32,
+    pub device: Arc<CudaDevice>,
+
+    /// ((OL, OK), (IM, IN)) preserved for linear-only shape math if needed
+    pub shape: ((usize, usize), (usize, usize)),
+    /// Marks whether this LoKr instance targets a conv weight
+    pub is_conv: bool,
 }
 
 impl LoKrModule {
-    /// Create a new LoKr module for Linear layer
-    ///
-    /// # Arguments
-    /// * `in_features` - Input dimension
-    /// * `out_features` - Output dimension
-    /// * `rank` - Rank of decomposition
-    /// * `alpha` - Scaling parameter (if None, uses rank)
-    /// * `factor` - Factorization hint (-1 for auto)
-    /// * `decompose_both` - Whether to decompose both w1 and w2
-    /// * `device` - CUDA device
-    pub fn new_linear(
-        in_features: usize,
-        out_features: usize,
-        rank: usize,
-        alpha: Option<f32>,
-        factor: i32,
-        decompose_both: bool,
-        device: Arc<CudaDevice>,
-    ) -> Result<Self> {
-        let alpha = alpha.unwrap_or(rank as f32);
-
-        // Factorize dimensions
-        let (in_m, in_n) = crate::ops::kronecker::factorization(in_features, factor);
-        let (out_l, out_k) = crate::ops::kronecker::factorization(out_features, factor);
-        let shape = ((out_l, out_k), (in_m, in_n));
-
-        // Decide on decomposition strategy
-        let use_w1 = !decompose_both || rank >= (out_l.max(in_m)) / 2;
-        let use_w2 = rank >= (out_k.max(in_n)) / 2;
-
-        let (w1, w1a, w1b) = if use_w1 {
-            // w1: (out_l, in_m) - kaiming_uniform with a=sqrt(5)
-            let w1 = tensor_utils::kaiming_uniform_bf16(
-                Shape::from_dims(&[out_l, in_m]),
-                (5.0_f32).sqrt(),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-            (Some(w1), None, None)
-        } else {
-            // w1a: (out_l, rank), w1b: (rank, in_m) - kaiming_uniform with a=sqrt(5)
-            let w1a = tensor_utils::kaiming_uniform_bf16(
-                Shape::from_dims(&[out_l, rank]),
-                (5.0_f32).sqrt(),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            let w1b = tensor_utils::kaiming_uniform_bf16(
-                Shape::from_dims(&[rank, in_m]),
-                (5.0_f32).sqrt(),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            (None, Some(w1a), Some(w1b))
-        };
-
-        let (w2, w2a, w2b) = if use_w2 {
-            // w2: (out_k, in_n) - init to zeros
-            let w2 = tensor_utils::zeros_bf16(
-                Shape::from_dims(&[out_k, in_n]),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-            (Some(w2), None, None)
-        } else {
-            // w2a: (out_k, rank) - kaiming_uniform, w2b: (rank, in_n) - zeros
-            let w2a = tensor_utils::kaiming_uniform_bf16(
-                Shape::from_dims(&[out_k, rank]),
-                (5.0_f32).sqrt(),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            let w2b = tensor_utils::zeros_bf16(
-                Shape::from_dims(&[rank, in_n]),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            (None, Some(w2a), Some(w2b))
-        };
-
-        // Validate BF16 storage
-        if let Some(ref w) = w1 {
-            assert_bf16_storage("w1", w)?;
-        }
-        if let Some(ref w) = w1a {
-            assert_bf16_storage("w1a", w)?;
-        }
-        if let Some(ref w) = w1b {
-            assert_bf16_storage("w1b", w)?;
-        }
-        if let Some(ref w) = w2 {
-            assert_bf16_storage("w2", w)?;
-        }
-        if let Some(ref w) = w2a {
-            assert_bf16_storage("w2a", w)?;
-        }
-        if let Some(ref w) = w2b {
-            assert_bf16_storage("w2b", w)?;
-        }
-
-        Ok(Self {
-            w1,
-            w1a,
-            w1b,
-            w2,
-            w2a,
-            w2b,
-            t2: None,
-            rank,
-            alpha,
-            device,
-            shape,
-            kernel_size: None,
-            kind: LayerKind::Linear,
-        })
-    }
-
-    /// Create a new LoKr module for Conv2d layer
-    ///
-    /// # Arguments
-    /// * `in_channels` - Input channels
-    /// * `out_channels` - Output channels
-    /// * `kernel_size` - Convolution kernel size (h, w)
-    /// * `rank` - Rank of decomposition
-    /// * `alpha` - Scaling parameter
-    /// * `factor` - Factorization hint
-    /// * `decompose_both` - Whether to decompose both factors
-    /// * `use_tucker` - Whether to use Tucker decomposition
-    /// * `device` - CUDA device
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_conv2d(
-        in_channels: usize,
-        out_channels: usize,
-        kernel_size: (usize, usize),
-        rank: usize,
-        alpha: Option<f32>,
-        factor: i32,
-        decompose_both: bool,
-        use_tucker: bool,
-        device: Arc<CudaDevice>,
-    ) -> Result<Self> {
-        let alpha = alpha.unwrap_or(rank as f32);
-        let (kh, kw) = kernel_size;
-
-        // Factorize dimensions
-        let (in_m, in_n) = crate::ops::kronecker::factorization(in_channels, factor);
-        let (out_l, out_k) = crate::ops::kronecker::factorization(out_channels, factor);
-        let shape = ((out_l, out_k), (in_m, in_n));
-
-        // Similar logic to linear, but with kernel dimensions
-        let use_w1 = !decompose_both || rank >= (out_l.max(in_m)) / 2;
-        let use_w2 = rank >= (out_k.max(in_n)) / 2 || (kh == 1 && kw == 1);
-
-        let (w1, w1a, w1b) = if use_w1 {
-            let w1 = tensor_utils::kaiming_uniform_bf16(
-                Shape::from_dims(&[out_l, in_m]),
-                (5.0_f32).sqrt(),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-            (Some(w1), None, None)
-        } else {
-            let w1a = tensor_utils::kaiming_uniform_bf16(
-                Shape::from_dims(&[out_l, rank]),
-                (5.0_f32).sqrt(),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            let w1b = tensor_utils::kaiming_uniform_bf16(
-                Shape::from_dims(&[rank, in_m]),
-                (5.0_f32).sqrt(),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            (None, Some(w1a), Some(w1b))
-        };
-
-        // Standardized Tucker orientation:
-        // w2a: [out_k, rank]
-        // t2: [rank, rank, kh, kw]
-        // w2b: [rank, in_n, kh, kw]
-        let (w2, w2a, w2b, t2) = if use_w2 {
-            let w2 = tensor_utils::zeros_bf16(
-                Shape::from_dims(&[out_k, in_n, kh, kw]),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-            (Some(w2), None, None, None)
-        } else if use_tucker && (kh > 1 || kw > 1) {
-            // Tucker decomposition for kernel
-            let t2 = tensor_utils::kaiming_uniform_bf16(
-                Shape::from_dims(&[rank, rank, kh, kw]),
-                (5.0_f32).sqrt(),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            let w2a = tensor_utils::kaiming_uniform_bf16(
-                Shape::from_dims(&[out_k, rank]),
-                (5.0_f32).sqrt(),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            let w2b = tensor_utils::zeros_bf16(
-                Shape::from_dims(&[rank, in_n]),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            (None, Some(w2a), Some(w2b), Some(t2))
-        } else {
-            // Standard decomposition
-            let w2a = tensor_utils::kaiming_uniform_bf16(
-                Shape::from_dims(&[out_k, rank]),
-                (5.0_f32).sqrt(),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            let w2b = tensor_utils::zeros_bf16(
-                Shape::from_dims(&[rank, in_n, kh, kw]),
-                device.clone(),
-            )
-            .map_err(Error::Flame)?;
-
-            (None, Some(w2a), Some(w2b), None)
-        };
-
-        // Validate BF16 storage
-        if let Some(ref w) = w1 {
-            assert_bf16_storage("w1", w)?;
-        }
-        if let Some(ref w) = w1a {
-            assert_bf16_storage("w1a", w)?;
-        }
-        if let Some(ref w) = w1b {
-            assert_bf16_storage("w1b", w)?;
-        }
-        if let Some(ref w) = w2 {
-            assert_bf16_storage("w2", w)?;
-        }
-        if let Some(ref w) = w2a {
-            assert_bf16_storage("w2a", w)?;
-        }
-        if let Some(ref w) = w2b {
-            assert_bf16_storage("w2b", w)?;
-        }
-        if let Some(ref t) = t2 {
-            assert_bf16_storage("t2", t)?;
-        }
-
-        Ok(Self {
-            w1,
-            w1a,
-            w1b,
-            w2,
-            w2a,
-            w2b,
-            t2,
-            rank,
-            alpha,
-            device,
-            shape,
-            kernel_size: Some(kernel_size),
-            kind: LayerKind::Conv2d,
-        })
-    }
-
-    /// Get the scaling factor (alpha / rank), returns 0.0 if rank==0
     #[inline]
-    pub fn scale(&self) -> f32 {
-        if self.rank == 0 {
-            return 0.0;
+    pub fn scale(&self) -> f32 { scale_from(self.alpha, self.rank) }
+
+    /// Resolve W1 as a dense matrix [OL,IM]
+    fn resolve_w1(&self) -> Result<Tensor> {
+        if let Some(ref w) = self.w1 {
+            assert_bf16_storage("w1", w)?;
+            return Ok(w.clone());
         }
-        self.alpha / self.rank as f32
+        let wa = self.w1a.as_ref().ok_or_else(|| Error::InvalidOperation("w1a missing".into()))?;
+        let wb = self.w1b.as_ref().ok_or_else(|| Error::InvalidOperation("w1b missing".into()))?;
+        assert_bf16_storage("w1a", wa)?;
+        assert_bf16_storage("w1b", wb)?;
+        wa.matmul(wb).map_err(Error::Flame) // [OL,IM]
     }
 
-    /// Merge into base weight tensor
-    pub fn merge_into(&self, base_weight: &mut Tensor, multiplier: f32) -> Result<()> {
-        let delta = self
-            .get_diff_weight()?
-            .mul_scalar(multiplier)
-            .map_err(Error::Flame)?;
-        // In-place add: base += delta
-        base_weight.add_inplace(&delta).map_err(Error::Flame)
+    /// Resolve W2 to a full conv kernel **in OK/IN/KH/KW order**.
+    /// Returns [OK,IN,KH,KW].
+    fn resolve_w2_full_ok_in_kh_kw(&self) -> Result<Tensor> {
+        if let Some(ref w) = self.w2 {
+            assert_bf16_storage("w2", w)?;
+            return Ok(w.clone()); // already [OK,IN,KH,KW]
+        }
+
+        // Tucker path: t2:[KH,KW,R,R], w2a:[OK,R], w2b:[R,IN]
+        if let Some(ref t) = self.t2 {
+            let w2a = self.w2a.as_ref().ok_or_else(|| Error::InvalidOperation("w2a missing for Tucker".into()))?;
+            let w2b = self.w2b.as_ref().ok_or_else(|| Error::InvalidOperation("w2b missing for Tucker".into()))?;
+            assert_bf16_storage("t2", t)?;
+            assert_bf16_storage("w2a", w2a)?;
+            assert_bf16_storage("w2b", w2b)?;
+            let ok  = w2a.dims()[0];
+            let r   = w2a.dims()[1];
+            let inn = w2b.dims()[1];
+            if w2b.dims()[0] != r {
+                return Err(Error::InvalidOperation("rank mismatch w2a/w2b".into()));
+            }
+            // rebuild_conv_tucker expects: t:[KH,KW,R,R], down:[1,1,IN,R], up:[1,1,R,OK]
+            let up   = w2a.reshape(&[1,1, r, ok]).map_err(Error::Flame)?;   // [1,1,R,OK]
+            let down = w2b.reshape(&[1,1, inn, r]).map_err(Error::Flame)?;  // [1,1,IN,R]
+            let k_hw_ic_oc = rebuild_conv_tucker(t, &down, &up)?;           // [KH,KW,IN,OK]
+            // Reorder to [OK,IN,KH,KW] for make_kronecker_conv_kernel's expected input
+            return k_hw_ic_oc.permute(&[3,2,0,1]).map_err(Error::Flame);
+        }
+
+        // Factorized non-Tucker:
+        // w2a:[OK,R], w2b:[R,IN] (1×1)  → full:[OK,IN,1,1]
+        // w2b:[R,IN,KH,KW] (spatial)    → full:[OK,IN,KH,KW] by contracting R at each (h,w)
+        let w2a = self.w2a.as_ref().ok_or_else(|| Error::InvalidOperation("w2a missing".into()))?;
+        let w2b = self.w2b.as_ref().ok_or_else(|| Error::InvalidOperation("w2b missing".into()))?;
+        assert_bf16_storage("w2a", w2a)?;
+        assert_bf16_storage("w2b", w2b)?;
+        let da = w2a.dims();
+        let db = w2b.dims();
+        let ok = da[0];
+        let r  = da[1];
+
+        match db.len() {
+            2 => {
+                let inn = db[1];
+                if db[0] != r { return Err(Error::InvalidOperation("rank mismatch w2a/w2b (1x1)".into())); }
+                let ok_in = w2a.matmul(w2b).map_err(Error::Flame)?; // [OK,IN]
+                ok_in.reshape(&[ok, inn, 1, 1]).map_err(Error::Flame)
+            }
+            4 => {
+                let (rb, inn, kh, kw) = (db[0], db[1], db[2], db[3]);
+                if rb != r { return Err(Error::InvalidOperation("rank mismatch w2a/w2b (spatial)".into())); }
+
+                // Reshape w2b: [R,IN,KH,KW] → [R, IN*KH*KW]
+                let w2b_flat = w2b.reshape(&[r, inn * kh * kw]).map_err(Error::Flame)?;
+
+                // Contract: [OK,R] @ [R, IN*KH*KW] → [OK, IN*KH*KW]
+                let result_flat = w2a.matmul(&w2b_flat).map_err(Error::Flame)?;
+
+                // Reshape to final: [OK, IN, KH, KW]
+                result_flat.reshape(&[ok, inn, kh, kw]).map_err(Error::Flame)
+            }
+            _ => Err(Error::InvalidOperation("unsupported w2b rank; expected [R,IN] or [R,IN,KH,KW]".into())),
+        }
     }
 }
 
 impl LycorisModule for LoKrModule {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let scale = self.scale();
-
-        // Early exit for zero rank or alpha
-        if scale == 0.0 {
-            return tensor_utils::zeros_bf16(
-                Shape::from_dims(x.dims()),
-                self.device.clone(),
-            )
-            .map_err(Error::Flame);
+        if !self.is_conv {
+            // Linear: x[..., IN] @ ΔW[IN,OUT]
+            let dw = self.get_diff_weight()?;
+            return x.matmul(&dw).map_err(Error::Flame);
         }
-
-        let use_w1 = self.w1.is_some();
-        let use_w2 = self.w2.is_some();
-
-        // Compute c = w1 or w1a @ w1b (BF16 storage, FP32 compute in kernels)
-        let c = if use_w1 {
-            self.w1.as_ref().unwrap().clone().map_err(Error::Flame)?
-        } else {
-            let w1a = self.w1a.as_ref().unwrap();
-            let w1b = self.w1b.as_ref().unwrap();
-            w1a.matmul(w1b).map_err(Error::Flame)?
-        };
-
-        match self.kind {
-            LayerKind::Linear => self.forward_linear(x, &c, use_w2, scale),
-            LayerKind::Conv2d => self.forward_conv2d(x, &c, use_w2, scale),
-        }
+        // Conv: NHWC with composed kernel
+        let k = self.get_diff_weight()?; // [KH,KW,IC,OC]
+        crate::ops::conv2d::conv2d(
+            x, &k, (1,1), (0,0), (1,1), 1,
+            crate::ops::conv2d::Layout::NHWC,
+        )
     }
 
     fn get_diff_weight(&self) -> Result<Tensor> {
-        let scale = self.scale();
+        let s = self.scale();
 
-        // Early exit for zero scale
-        if scale == 0.0 {
-            return tensor_utils::zeros_bf16(
-                Shape::from_dims(&[
-                    self.shape.0 .0 * self.shape.0 .1,
-                    self.shape.1 .0 * self.shape.1 .1,
-                ]),
-                self.device.clone(),
-            )
-            .map_err(Error::Flame);
-        }
-
-        // Compute w1
-        let w1 = if let Some(ref w1_full) = self.w1 {
-            w1_full.clone().map_err(Error::Flame)?
-        } else {
-            let w1a = self.w1a.as_ref().ok_or_else(|| {
-                Error::InvalidOperation("w1a missing in factorized mode".to_string())
-            })?;
-            let w1b = self.w1b.as_ref().ok_or_else(|| {
-                Error::InvalidOperation("w1b missing in factorized mode".to_string())
-            })?;
-            w1a.matmul(w1b).map_err(Error::Flame)?
-        };
-
-        // Compute w2
-        let w2 = if let Some(ref w2_full) = self.w2 {
-            w2_full.clone().map_err(Error::Flame)?
-        } else if let Some(ref t2) = self.t2 {
-            // Tucker reconstruction
-            let w2a = self.w2a.as_ref().ok_or_else(|| {
-                Error::InvalidOperation("w2a missing in Tucker mode".to_string())
-            })?;
-            let w2b = self.w2b.as_ref().ok_or_else(|| {
-                Error::InvalidOperation("w2b missing in Tucker mode".to_string())
-            })?;
-            crate::ops::tucker::rebuild_tucker(t2, w2a, w2b)?
-        } else {
-            // Standard factorization: w2 = w2a @ w2b
-            let w2a = self.w2a.as_ref().ok_or_else(|| {
-                Error::InvalidOperation("w2a missing in factorized mode".to_string())
-            })?;
-            let w2b = self.w2b.as_ref().ok_or_else(|| {
-                Error::InvalidOperation("w2b missing in factorized mode".to_string())
-            })?;
-
-            let w2b_dims = w2b.dims();
-            let w2b_reshaped = w2b
-                .reshape(&[w2b_dims[0], w2b_dims[1..].iter().product()])
-                .map_err(Error::Flame)?;
-
-            let result = w2a.matmul(&w2b_reshaped).map_err(Error::Flame)?;
-
-            // Reshape back if needed
-            if w2b_dims.len() > 2 {
-                let mut new_shape = vec![w2a.dims()[0]];
-                new_shape.extend_from_slice(&w2b_dims[1..]);
-                result.reshape(&new_shape).map_err(Error::Flame)?
+        if !self.is_conv {
+            // Linear ΔW: kron(W1:[OL,IM], W2:[OK,IN]) → [IN,OUT]
+            let w1 = self.resolve_w1()?; // [OL,IM]
+            // Build W2 (linear 2D) from provided W2 state
+            let w2_lin: Tensor = if let Some(ref w2_full) = self.w2 {
+                let d = w2_full.dims();
+                if d.len() == 2 {
+                    w2_full.clone()
+                } else if d.len() == 4 && d[2] == 1 && d[3] == 1 {
+                    // [OK,IN,1,1] → [OK,IN]
+                    w2_full.reshape(&[d[0], d[1]]).map_err(Error::Flame)?
+                } else {
+                    return Err(Error::InvalidOperation("linear LoKr requires 2D w2 (or KH=KW=1)".into()));
+                }
+            } else if let (Some(ref a), Some(ref b)) = (&self.w2a, &self.w2b) {
+                // [OK,R]@[R,IN] → [OK,IN]
+                a.matmul(b).map_err(Error::Flame)?
             } else {
-                result
-            }
-        };
+                // pure W1-only LoKr isn't meaningful for kron; bail
+                return Err(Error::InvalidOperation("missing W2 for linear LoKr".into()));
+            };
+            return make_kronecker(&w1, &w2_lin, s);
+        }
 
-        // Ensure BF16 storage
-        assert_bf16_storage("w1", &w1)?;
-        assert_bf16_storage("w2", &w2)?;
-
-        // Compute Kronecker product
-        let kron_result = crate::ops::kronecker::make_kronecker(&w1, &w2, scale)?;
-        assert_bf16_storage("ΔW", &kron_result)?;
-
-        Ok(kron_result)
+        // Conv ΔK: need W1:[OL,IM] and W2_full:[OK,IN,KH,KW], then kron → [KH,KW,IC,OC]
+        let w1 = self.resolve_w1()?;                  // [OL,IM]
+        let w2_full_ok_in = self.resolve_w2_full_ok_in_kh_kw()?; // [OK,IN,KH,KW]
+        make_kronecker_conv_kernel(&w1, &w2_full_ok_in, s)        // [KH,KW,IC,OC]
     }
 
-    fn merge_to(&mut self, multiplier: f32) -> Result<()> {
-        // This is now deprecated in favor of merge_into()
-        // which takes a mutable base weight
-        let _diff_weight = self.get_diff_weight()?;
-        let _scaled_diff = _diff_weight
-            .mul_scalar(multiplier)
-            .map_err(Error::Flame)?;
-
-        // Note: Cannot merge without base weight reference
-        // Use merge_into() instead
+    fn merge_to(&mut self, _multiplier: f32) -> Result<()> {
+        // Deprecated - use external merging logic
         Ok(())
-    }
-}
-
-impl LoKrModule {
-    fn forward_linear(
-        &self,
-        x: &Tensor,
-        c: &Tensor,
-        use_w2: bool,
-        scale: f32,
-    ) -> Result<Tensor> {
-        let x_dims = x.dims();
-        let last = *x_dims
-            .last()
-            .ok_or_else(|| Error::InvalidOperation("x has no dims".into()))?;
-        let uq = c.dims()[1];
-
-        if last % uq != 0 {
-            return Err(Error::InvalidOperation(format!(
-                "feature dim {} not divisible by uq {}",
-                last, uq
-            )));
-        }
-        let vq = last / uq;
-
-        // (b,..., uq*vq) -> (b,..., uq, vq)
-        let reshaped = x
-            .reshape(
-                &x_dims[..x_dims.len() - 1]
-                    .iter()
-                    .cloned()
-                    .chain([uq, vq])
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(Error::Flame)?;
-
-        // Apply BA / A,B
-        let hb = if use_w2 {
-            let ba_tensor = self.w2.as_ref().unwrap();
-            reshaped.matmul(ba_tensor).map_err(Error::Flame)?
-        } else {
-            let a_tensor = self.w2b.as_ref().unwrap();
-            let b_tensor = self.w2a.as_ref().unwrap();
-            let ha = reshaped.matmul(a_tensor).map_err(Error::Flame)?;
-            ha.matmul(b_tensor).map_err(Error::Flame)?
-        };
-
-        // swap (..., uq, vq) -> (..., vq, uq)
-        let h_swapped = swap_last_two(&hb)?;
-
-        // F.linear with C (use C^T)
-        let c_t = crate::tensor_utils::transpose_2d(c)?;
-        let hc = h_swapped.matmul(&c_t).map_err(Error::Flame)?;
-
-        // collapse last two dims back to (..., vq*up)
-        let hc_dims = hc.dims();
-        let n = hc_dims.len();
-        let mut final_shape = hc_dims[..n - 2].to_vec();
-        final_shape.push(hc_dims[n - 2] * hc_dims[n - 1]);
-        let out = hc.reshape(&final_shape).map_err(Error::Flame)?;
-
-        // scale
-        out.mul_scalar(scale).map_err(Error::Flame)
-    }
-
-    fn forward_conv2d(
-        &self,
-        x: &Tensor,
-        c: &Tensor,
-        use_w2: bool,
-        scale: f32,
-    ) -> Result<Tensor> {
-        // Conv2d path - placeholder for real conv2d ops
-        // This needs actual conv2d kernels which aren't implemented yet
-
-        // For now, return error indicating conv2d needs implementation
-        Err(Error::InvalidOperation(
-            "Conv2d forward path requires conv2d kernel implementation. \
-             Need: conv1x1_grouped() for A/B and conv_spatial_rank() for T. \
-             See original issue for full implementation details.".into()
-        ))
-
-        /* Full implementation outline:
-
-        let xd = x.dims();
-        if xd.len() != 4 {
-            return Err(Error::InvalidOperation("conv expects NHWC [B,H,W,C]".into()));
-        }
-
-        let uq = c.dims()[1];
-        let cin = xd[3];
-        if cin % uq != 0 {
-            return Err(Error::InvalidOperation("C_in not divisible by uq".into()));
-        }
-
-        let (kh, kw) = self.kernel_size.unwrap_or((1, 1));
-
-        if use_w2 {
-            let w2_full = self.w2.as_ref().unwrap();
-            // Need: conv2d(x, w2_full, stride=(1,1), pad=(kh/2, kw/2), groups=1, layout=NHWC)
-            // Then reshape and apply C
-        } else {
-            let a = self.w2b.as_ref().unwrap();
-            let b = self.w2a.as_ref().unwrap();
-
-            // Need: conv1x1_grouped(x, a_as_kernel, groups=uq)
-            // Then: conv_spatial_rank(ha, t, ...) if Tucker
-            // Then: conv1x1_grouped(ht, b_as_kernel, groups=uq)
-            // Finally apply C
-        }
-        */
     }
 }
 
@@ -633,31 +188,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lokr_creation() {
-        // Placeholder - requires CUDA device initialization
-        assert!(true);
-    }
-
-    #[test]
     fn test_scale_zero_rank() {
-        // Test safe scale() with rank=0
-        let device = Arc::new(CudaDevice::new(0).unwrap());
-        let module = LoKrModule {
-            w1: None,
-            w1a: None,
-            w1b: None,
-            w2: None,
-            w2a: None,
-            w2b: None,
-            t2: None,
-            rank: 0,
-            alpha: 1.0,
-            device,
-            shape: ((2, 2), (2, 2)),
-            kernel_size: None,
-            kind: LayerKind::Linear,
-        };
-
-        assert_eq!(module.scale(), 0.0);
+        assert_eq!(scale_from(1.0, 0), 0.0);
+        assert_eq!(scale_from(8.0, 4), 2.0);
     }
 }

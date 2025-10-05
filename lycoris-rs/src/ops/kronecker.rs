@@ -51,8 +51,7 @@ pub fn make_kronecker(w1: &Tensor, w2: &Tensor, scale: f32) -> Result<Tensor> {
         return crate::tensor_utils::zeros_bf16(
             Shape::from_dims(&out_dims),
             w2.device().clone(),
-        )
-        .map_err(Error::Flame);
+        );
     }
 
     // Reshape for broadcast: A_rs: [m,1,n,1,1..], B_rs: [1,p,1,q,tail..]
@@ -117,8 +116,7 @@ pub fn make_kronecker_conv_kernel(w1: &Tensor, w2: &Tensor, scale: f32) -> Resul
         return crate::tensor_utils::zeros_bf16(
             Shape::from_dims(&[kh, kw, im * inn, ol * ok]),
             w2.device().clone(),
-        )
-        .map_err(Error::Flame);
+        );
     }
 
     // View for broadcast outer product:
