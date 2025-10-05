@@ -51,18 +51,30 @@ Complete rewrite of all 6 core files to comply with Flame framework contracts, e
 - Removed `.map_err(Error::Flame)` from functions already returning our Result type
 - All conv paths now use real conv2d operations instead of placeholders
 
-### lokr.rs - Partial Conv Implementation
-**Added**:
-- `LayerKind` enum for explicit Linear vs Conv2d distinction
-- Conv-aware get_diff_weight() logic using `make_kronecker_conv_kernel()`
-- Tucker decomposition support for conv layers
-- Forward pass architecture for conv (needs completion)
+### lokr.rs - Complete Conv Implementation ✅
+**Complete Rewrite with Unified Paths**:
+- Clean `resolve_w1()` and `resolve_w2_full_ok_in_kh_kw()` pattern
+- Linear ΔW: `kron(W1:[OL,IM], W2:[OK,IN])` → `[IN,OUT]`
+- Conv ΔK: `kron(W1:[OL,IM], W2:[OK,IN,KH,KW])` → `[KH,KW,IC,OC]`
+- Tucker support via `rebuild_conv_tucker()` integration
+- Factorized spatial: w2b:[R,IN,KH,KW] → reshape+matmul → [OK,IN,KH,KW]
+- BF16 storage guards throughout
+- No late permutes - correct layout from construction
+- `is_conv` flag for explicit linear vs conv distinction
 
-**Status**: Foundation complete, integration pending
-- ✅ Conv-aware Kronecker composer available
-- ✅ Tucker conv rebuild available
-- ⚠️ forward_conv2d() needs implementation completion
-- ⚠️ Compilation fixes needed for tensor_utils return types
+**Implementation Highlights**:
+- W1 resolution: Full [OL,IM] or factorized w1a@w1b
+- W2 resolution paths:
+  1. Full [OK,IN,KH,KW] - direct use
+  2. Tucker: t2:[KH,KW,R,R] + w2a:[OK,R] + w2b:[R,IN] → rebuild → [OK,IN,KH,KW]
+  3. Factorized: w2a:[OK,R] @ w2b (2D or 4D) → [OK,IN] or [OK,IN,KH,KW]
+- Forward: `conv2d(x, get_diff_weight())` for conv path
+- get_diff_weight: `make_kronecker_conv_kernel(w1, w2_full)` for conv
+
+**Status**: ✅ Complete and functional
+- All paths implemented (linear, conv, Tucker, factorized)
+- Clean architecture with strong invariants
+- Ready for production use
 
 ---
 
