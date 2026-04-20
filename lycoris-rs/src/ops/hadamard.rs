@@ -111,13 +111,21 @@ pub fn make_hadamard_weight(
 ///
 /// ΔW = rebuild(t1, w1a, w1b) ⊙ rebuild(t2, w2a, w2b) * scale
 ///
+/// Matches upstream `HadaWeightTucker.forward` in
+/// `lycoris/functional/loha.py:38-41`, using the einsum
+/// `"i j ..., j r, i p -> p r ..."`. The Python on-disk layout is:
+///     t: [R, R, KH, KW]     w1d: [R, IN]     w1u: [R, OUT]
+/// After our loader permute/transposes this becomes:
+///     t : [KH, KW, R, R]    w1a: [IN, R]     w1b: [R, OUT]
+/// and the output is in Flame convention `[KH, KW, IC=IN, OC=OUT]`.
+///
 /// # Arguments
 /// * `t1` - Tucker core tensor 1: [KH, KW, RANK, RANK], BF16
-/// * `w1a` - First down weight: [1, 1, IC, RANK], BF16
-/// * `w1b` - First up weight: [1, 1, RANK, OC], BF16
+/// * `w1a` - First down weight (was `w1d`): [IN, RANK], BF16
+/// * `w1b` - First up weight   (was `w1u`): [RANK, OUT], BF16
 /// * `t2` - Tucker core tensor 2: [KH, KW, RANK, RANK], BF16
-/// * `w2a` - Second down weight: [1, 1, IC, RANK], BF16
-/// * `w2b` - Second up weight: [1, 1, RANK, OC], BF16
+/// * `w2a` - Second down weight: [IN, RANK], BF16
+/// * `w2b` - Second up weight:   [RANK, OUT], BF16
 /// * `scale` - Scaling factor
 pub fn make_hadamard_weight_tucker(
     t1: &Tensor,
@@ -136,20 +144,90 @@ pub fn make_hadamard_weight_tucker(
     assert_bf16_storage("w2a", w2a)?;
     assert_bf16_storage("w2b", w2b)?;
 
-    // Early exit for zero scale
+    let td1 = t1.dims();
+    let td2 = t2.dims();
+    if td1.len() != 4 || td2.len() != 4 {
+        return Err(Error::InvalidOperation(
+            "Tucker LoHa: t1/t2 must be 4D [KH,KW,R,R]".into(),
+        ));
+    }
+    let (kh, kw, r1a, r1b) = (td1[0], td1[1], td1[2], td1[3]);
+    if td2[0] != kh || td2[1] != kw || td2[2] != r1a || td2[3] != r1b {
+        return Err(Error::InvalidOperation(format!(
+            "Tucker LoHa: t1 {:?} and t2 {:?} must have identical shape",
+            td1, td2
+        )));
+    }
+    let (wa1, wb1) = (w1a.dims(), w1b.dims());
+    let (wa2, wb2) = (w2a.dims(), w2b.dims());
+    if wa1.len() != 2 || wb1.len() != 2 || wa2.len() != 2 || wb2.len() != 2 {
+        return Err(Error::InvalidOperation(
+            "Tucker LoHa: w1a/w1b/w2a/w2b must be 2D (IN,R)/(R,OUT)".into(),
+        ));
+    }
+    let inn = wa1[0];
+    let r_j = wa1[1];
+    let r_i = wb1[0];
+    let out = wb1[1];
+    if r_j != r1b || r_i != r1a {
+        return Err(Error::InvalidOperation(format!(
+            "Tucker LoHa: rank mismatch t1 [KH,KW,{},{}] vs w1a[:,{}], w1b[{},:]",
+            r1a, r1b, r_j, r_i
+        )));
+    }
+    if wa2[0] != inn || wa2[1] != r_j || wb2[0] != r_i || wb2[1] != out {
+        return Err(Error::InvalidOperation(
+            "Tucker LoHa: branch-2 shapes must match branch-1".into(),
+        ));
+    }
+
+    // Early exit for zero scale → return zero kernel of the final shape.
     if scale == 0.0 {
         return crate::tensor_utils::zeros_bf16(
-            t1.shape().clone(),
+            flame_core::Shape::from_dims(&[kh, kw, inn, out]),
             t1.device().clone(),
         );
     }
 
-    // Tucker reconstruction requires proper tensor contraction
-    // For now, return error indicating full implementation needed
-    Err(Error::InvalidOperation(
-        "Tucker Hadamard weight reconstruction requires full tensor contraction implementation. \
-         Use non-Tucker path or implement tensor slice assignment for full Tucker support.".into()
-    ))
+    // Reconstruct one branch: kernel[KH,KW,IN,OUT] from t[KH,KW,i=R,j=R], wa[IN, j=R], wb[i=R, OUT].
+    //   Step 1: reshape t to [KH*KW, R_i, R_j].
+    //   Step 2: contract with wa along j → [KH*KW, R_i, IN]
+    //           via matmul([KH*KW, R_i, R_j], [R_j, IN]) where [R_j, IN] = wa.transpose().
+    //   Step 3: permute to [KH*KW, IN, R_i].
+    //   Step 4: contract with wb along i → [KH*KW, IN, OUT]
+    //           via matmul([KH*KW, IN, R_i], [R_i, OUT]).
+    //   Step 5: reshape to [KH, KW, IN, OUT].
+    fn rebuild_branch(
+        t: &Tensor,
+        wa: &Tensor,
+        wb: &Tensor,
+        kh: usize,
+        kw: usize,
+        r_i: usize,
+        r_j: usize,
+        inn: usize,
+        out: usize,
+    ) -> Result<Tensor> {
+        let t_3d = t.reshape(&[kh * kw, r_i, r_j]).map_err(Error::Flame)?;
+        // wa is [IN, R_j]; we need [R_j, IN].
+        let wa_t = wa.transpose().map_err(Error::Flame)?;
+        // [KH*KW, R_i, R_j] @ [R_j, IN] = [KH*KW, R_i, IN]
+        let step1 = t_3d.matmul(&wa_t).map_err(Error::Flame)?;
+        // Permute last two dims to [KH*KW, IN, R_i].
+        let step1p = step1.permute(&[0, 2, 1]).map_err(Error::Flame)?;
+        // [KH*KW, IN, R_i] @ [R_i, OUT] = [KH*KW, IN, OUT]
+        let step2 = step1p.matmul(wb).map_err(Error::Flame)?;
+        // Reshape to [KH, KW, IN, OUT].
+        step2
+            .reshape(&[kh, kw, inn, out])
+            .map_err(Error::Flame)
+    }
+
+    let branch1 = rebuild_branch(t1, w1a, w1b, kh, kw, r_i, r_j, inn, out)?;
+    let branch2 = rebuild_branch(t2, w2a, w2b, kh, kw, r_i, r_j, inn, out)?;
+
+    let hadamard = branch1.mul(&branch2).map_err(Error::Flame)?;
+    hadamard.mul_scalar(scale).map_err(Error::Flame)
 }
 
 #[cfg(test)]

@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_scale_zero_rank() {
-        let device = Arc::new(CudaDevice::new(0).unwrap());
+        let device = CudaDevice::new(0).unwrap();
         let module = LoHaModule {
             w1a: tensor_utils::zeros_bf16(Shape::from_dims(&[4, 0]), device.clone()).unwrap(),
             w1b: tensor_utils::zeros_bf16(Shape::from_dims(&[0, 8]), device.clone()).unwrap(),

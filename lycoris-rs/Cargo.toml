@@ -7,7 +7,7 @@ license = "MIT"
 description = "Rust port of LyCORIS - LoRA algorithms (LoRA, LoHa, LoKr) with BF16 storage and FP32 compute"
 
 [dependencies]
-flame-core = { path = "../../flame/flame-core" }
+flame-core = { path = "../../flame-core" }
 cudarc = { version = "0.11.9", features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
 half = { version = "2.3", features = ["num-traits"] }
 num-traits = "0.2"

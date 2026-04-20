@@ -317,52 +317,10 @@ impl LycorisModule for LoConModule {
         if self.is_conv {
             // Conv path
             if let Some(ref mid) = self.mid {
-                // Tucker reconstruction: down → mid → up
-                // mid: [KH, KW, RANK, RANK], down: [1, 1, IC, RANK], up: [1, 1, RANK, OC]
-                // Result: [KH, KW, IC, OC]
-
-                // Contract down with mid along RANK dimension
-                // down [1,1,IC,R] reshaped to [IC,R], mid [KH,KW,R,R] reshaped to flatten spatial
-                let kh = mid.dims()[0];
-                let kw = mid.dims()[1];
-                let ic = self.down.dims()[2];
-                let r = self.down.dims()[3];
-                let oc = self.up.dims()[3];
-
-                // Reshape down: [1,1,IC,R] -> [IC,R]
-                let down_2d = self.down.reshape(&[ic, r]).map_err(Error::Flame)?;
-
-                // Reshape mid: [KH,KW,R,R] -> [KH*KW, R, R]
-                let mid_3d = mid.reshape(&[kh * kw, r, r]).map_err(Error::Flame)?;
-
-                // Reshape up: [1,1,R,OC] -> [R,OC]
-                let up_2d = self.up.reshape(&[r, oc]).map_err(Error::Flame)?;
-
-                // Contract: down @ mid @ up for each spatial position
-                // For simplicity: flatten and contract
-                let mut result = tensor_utils::zeros_bf16(
-                    Shape::from_dims(&[kh, kw, ic, oc]),
-                    self.device.clone(),
-                )?;
-
-                // Simple einsum-like contraction
-                // This is a simplified version - full Tucker requires proper tensor contraction
-                for h in 0..kh {
-                    for w in 0..kw {
-                        let idx = h * kw + w;
-                        let mid_slice = mid_3d.narrow(0, idx, 1)?.reshape(&[r, r])?;
-                        let temp = down_2d.matmul(&mid_slice).map_err(Error::Flame)?;
-                        let kernel_hw = temp.matmul(&up_2d).map_err(Error::Flame)?;
-
-                        // Copy into result at position [h, w, :, :]
-                        // This requires tensor assignment which may not be available
-                        // For now, return error indicating full Tucker needs implementation
-                    }
-                }
-
-                return Err(Error::InvalidOperation(
-                    "Tucker conv decomposition requires full tensor contraction implementation".into()
-                ));
+                // Tucker reconstruction: mid[KH,KW,R,R], down[1,1,IC,R], up[1,1,R,OC]
+                // → kernel [KH,KW,IC,OC], then apply scale.
+                let kernel = crate::ops::tucker::rebuild_conv_tucker(mid, &self.down, &self.up)?;
+                return kernel.mul_scalar(scale).map_err(Error::Flame);
             } else {
                 // Standard LoRA conv
                 let down_dims = self.down.dims();
@@ -434,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_scale_zero_rank() {
-        let device = Arc::new(CudaDevice::new(0).unwrap());
+        let device = CudaDevice::new(0).unwrap();
         let module = LoConModule {
             down: tensor_utils::zeros_bf16(Shape::from_dims(&[4, 0]), device.clone()).unwrap(),
             up: tensor_utils::zeros_bf16(Shape::from_dims(&[0, 8]), device.clone()).unwrap(),
@@ -450,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_as_conv1x1_kernel() {
-        let device = Arc::new(CudaDevice::new(0).unwrap());
+        let device = CudaDevice::new(0).unwrap();
         let w = tensor_utils::zeros_bf16(Shape::from_dims(&[3, 5]), device.clone()).unwrap();
         let k = as_conv1x1_kernel(&w).unwrap();
         assert_eq!(k.dims(), &[1, 1, 3, 5]);

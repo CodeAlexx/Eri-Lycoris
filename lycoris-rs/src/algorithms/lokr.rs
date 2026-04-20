@@ -20,7 +20,22 @@ fn assert_bf16_storage(name: &str, t: &Tensor) -> Result<()> {
 
 #[inline]
 fn scale_from(alpha: f32, rank: usize) -> f32 {
-    if rank == 0 { 0.0 } else { alpha / rank as f32 }
+    // Mirrors `lycoris.functional.lokr.diff_weight` (functional/lokr.py:135-141):
+    //
+    //     if w1a is not None: rank = w1a.shape[1]
+    //     elif w2a is not None: rank = w2a.shape[1]
+    //     else:                 rank = gamma         # ← full-W1 + full-W2 case
+    //     scale = gamma / rank                       # = 1.0 in the else branch
+    //
+    // Rust's loader sets `rank = 0` when neither side is factorized. Returning
+    // `alpha / 0` here would short-circuit `make_kronecker` to a zeros tensor
+    // (P0-4: silently zero ΔW). Match Python: when rank is unknown, the
+    // composed kernel is the unscaled Kronecker product, i.e. scale = 1.0.
+    if rank == 0 {
+        1.0
+    } else {
+        alpha / rank as f32
+    }
 }
 
 /// LoKr module supports either full or factorized W1/W2. For conv, W2 may be Tucker/factorized.
@@ -71,25 +86,45 @@ impl LoKrModule {
             return Ok(w.clone()); // already [OK,IN,KH,KW]
         }
 
-        // Tucker path: t2:[KH,KW,R,R], w2a:[OK,R], w2b:[R,IN]
+        // Tucker path. Upstream `lycoris.functional.lokr.weight_gen` saves
+        // (functional/lokr.py:71-74):
+        //   t2  : [R, R, KH, KW]
+        //   w2a : [R, shape[0][1]] = [R, OK]    ← rank is axis 0!
+        //   w2b : [R, shape[1][1]] = [R, IN]
+        //
+        // The non-Tucker save (functional/lokr.py:77-78) flips w2a to
+        // [OK, R] and lifts w2b to 4D [R, IN, KH, KW]. The Rust code used
+        // to read `ok = w2a.dims()[0]; r = w2a.dims()[1]` for both branches,
+        // which is correct for non-Tucker but inverts the Tucker layout
+        // (P0-5: silent corruption — data dims happened to look plausible
+        // because R≈OK for many shapes).
+        //
+        // The loader hands us t2 already permuted to [KH, KW, R, R].
         if let Some(ref t) = self.t2 {
             let w2a = self.w2a.as_ref().ok_or_else(|| Error::InvalidOperation("w2a missing for Tucker".into()))?;
             let w2b = self.w2b.as_ref().ok_or_else(|| Error::InvalidOperation("w2b missing for Tucker".into()))?;
             assert_bf16_storage("t2", t)?;
             assert_bf16_storage("w2a", w2a)?;
             assert_bf16_storage("w2b", w2b)?;
-            let ok  = w2a.dims()[0];
-            let r   = w2a.dims()[1];
+            let r   = w2a.dims()[0];
+            let ok  = w2a.dims()[1];
+            let r2  = w2b.dims()[0];
             let inn = w2b.dims()[1];
-            if w2b.dims()[0] != r {
-                return Err(Error::InvalidOperation("rank mismatch w2a/w2b".into()));
+            if r2 != r {
+                return Err(Error::InvalidOperation(format!(
+                    "Tucker LoKr rank mismatch: w2a[0]={}, w2b[0]={}", r, r2
+                )));
             }
-            // rebuild_conv_tucker expects: t:[KH,KW,R,R], down:[1,1,IN,R], up:[1,1,R,OK]
-            let up   = w2a.reshape(&[1,1, r, ok]).map_err(Error::Flame)?;   // [1,1,R,OK]
-            let down = w2b.reshape(&[1,1, inn, r]).map_err(Error::Flame)?;  // [1,1,IN,R]
-            let k_hw_ic_oc = rebuild_conv_tucker(t, &down, &up)?;           // [KH,KW,IN,OK]
+            // rebuild_conv_tucker expects: t:[KH,KW,R,R], down:[1,1,IC,R], up:[1,1,R,OC].
+            // Here IC=IN, OC=OK. w2a is [R, OK] on disk, so transpose to [OK, R]
+            // before reshaping to [1, 1, R, OK]. Same for w2b ([R, IN] → [IN, R]).
+            let w2a_t = w2a.transpose().map_err(Error::Flame)?;  // [OK, R]
+            let w2b_t = w2b.transpose().map_err(Error::Flame)?;  // [IN, R]
+            let up   = w2a_t.reshape(&[1, 1, r, ok]).map_err(Error::Flame)?;   // [1,1,R,OK]
+            let down = w2b_t.reshape(&[1, 1, inn, r]).map_err(Error::Flame)?;  // [1,1,IN,R]
+            let k_hw_ic_oc = rebuild_conv_tucker(t, &down, &up)?;              // [KH,KW,IN,OK]
             // Reorder to [OK,IN,KH,KW] for make_kronecker_conv_kernel's expected input
-            return k_hw_ic_oc.permute(&[3,2,0,1]).map_err(Error::Flame);
+            return k_hw_ic_oc.permute(&[3, 2, 0, 1]).map_err(Error::Flame);
         }
 
         // Factorized non-Tucker:
@@ -189,7 +224,10 @@ mod tests {
 
     #[test]
     fn test_scale_zero_rank() {
-        assert_eq!(scale_from(1.0, 0), 0.0);
+        // P0-4: rank=0 (neither W1 nor W2 factorized) must NOT produce 0
+        // because that silently zeros ΔW. Mirror Python: scale = gamma/gamma = 1.0.
+        assert_eq!(scale_from(1.0, 0), 1.0);
+        assert_eq!(scale_from(8.0, 0), 1.0);
         assert_eq!(scale_from(8.0, 4), 2.0);
     }
 }

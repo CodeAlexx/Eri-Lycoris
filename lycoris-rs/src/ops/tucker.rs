@@ -146,38 +146,35 @@ pub fn rebuild_conv_tucker(
     let up_2d = up.reshape(&[r_up, oc]).map_err(Error::Flame)?;
 
     // For each spatial position (h,w), contract: down @ core[h,w] @ up
-    // Result: [KH, KW, IC, OC]
-    let mut result = crate::tensor_utils::zeros_bf16(
-        flame_core::Shape::from_dims(&[kh, kw, ic, oc]),
-        core.device().clone(),
-    )?;
-
+    // Result: [KH, KW, IC, OC].
+    //
+    // Flame has no `index_put`; assemble per-slice kernels then stack along
+    // axis 0 (KH) and axis 1 (KW). Each spatial kernel is an IC×OC matrix.
+    let mut row_slabs: Vec<Tensor> = Vec::with_capacity(kh);
     for h in 0..kh {
+        let mut col_slabs: Vec<Tensor> = Vec::with_capacity(kw);
         for w in 0..kw {
-            // Get core slice at [h, w, :, :] → [R, R]
+            // core[h, w, :, :] → [R, R]
             let core_hw = core
-                .narrow(0, h, 1)?
-                .narrow(1, w, 1)?
+                .narrow(0, h, 1)
+                .map_err(Error::Flame)?
+                .narrow(1, w, 1)
+                .map_err(Error::Flame)?
                 .reshape(&[r1, r2])
                 .map_err(Error::Flame)?;
 
-            // Contract: [IC,R] @ [R,R] @ [R,OC] → [IC,OC]
+            // Contract: [IC,R] @ [R,R] @ [R,OC] → [IC, OC]
             let temp = down_2d.matmul(&core_hw).map_err(Error::Flame)?;
             let kernel_hw = temp.matmul(&up_2d).map_err(Error::Flame)?;
-
-            // Reshape to [1, 1, IC, OC] and write to result
-            let kernel_4d = kernel_hw.reshape(&[1, 1, ic, oc]).map_err(Error::Flame)?;
-
-            // Write slice (needs tensor assignment - placeholder for now)
-            // This requires tensor slice assignment which may not be available
-            // For now, accumulate or return error
-            result = result
-                .index_put(&[h as i64, w as i64], &kernel_4d)
-                .map_err(Error::Flame)?;
+            col_slabs.push(kernel_hw);
         }
+        // Stack the KW slabs along a new axis → [KW, IC, OC]
+        let row = Tensor::stack(&col_slabs, 0).map_err(Error::Flame)?;
+        row_slabs.push(row);
     }
 
-    Ok(result)
+    // Stack the KH rows along a new axis → [KH, KW, IC, OC]
+    Tensor::stack(&row_slabs, 0).map_err(Error::Flame)
 }
 
 #[cfg(test)]
