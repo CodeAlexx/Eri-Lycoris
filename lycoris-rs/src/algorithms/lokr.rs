@@ -539,13 +539,19 @@ impl LoKrModule {
 
 impl LycorisModule for LoKrModule {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // See `LoConModule::forward` for the dtype-coercion rationale —
+        // dw is composed from F32-storage params; cast to `x.dtype()` *with
+        // autograd recording* before mixing into the residual graph.
+        let target_dtype = x.dtype();
         if !self.is_conv {
             // Linear: x[..., IN] @ ΔW[IN,OUT]
             let dw = self.get_diff_weight()?;
+            let dw = if dw.dtype() != target_dtype { dw.to_dtype(target_dtype).map_err(Error::Flame)? } else { dw };
             return x.matmul(&dw).map_err(Error::Flame);
         }
         // Conv: NHWC with composed kernel
         let k = self.get_diff_weight()?; // [KH,KW,IC,OC]
+        let k = if k.dtype() != target_dtype { k.to_dtype(target_dtype).map_err(Error::Flame)? } else { k };
         crate::ops::conv2d::conv2d(
             x, &k, (1,1), (0,0), (1,1), 1,
             crate::ops::conv2d::Layout::NHWC,

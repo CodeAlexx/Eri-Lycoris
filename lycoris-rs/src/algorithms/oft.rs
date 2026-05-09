@@ -296,22 +296,21 @@ impl OFTModule {
             )));
         }
 
-        // Compute R in F32, then cast to compute dtype.
+        // Compute R in F32, then cast to x.dtype() (NOT storage_dtype) so the
+        // residual graph stays in input dtype.  See `LoConModule::forward`
+        // for rationale: an F32 sub-tape spawned from BF16 inputs corrupts
+        // FlashAttention backward downstream
+        // (CUDA_ERROR_MISALIGNED_ADDRESS, 2026-05-09).  The cast is in
+        // record-mode so backward routes Cast → F32 leaf (blocks).
         let r_f32 = self.cayley_neumann()?;
-        let target_dtype = self.storage_dtype.to_dtype();
-        let r = if target_dtype != DType::F32 {
-            r_f32.to_dtype(target_dtype).map_err(Error::Flame)?
+        let x_dtype = x.dtype();
+        let r = if x_dtype != DType::F32 {
+            r_f32.to_dtype(x_dtype).map_err(Error::Flame)?
         } else {
             r_f32
         };
-
-        // Cast x to compute dtype if needed (and remember original).
-        let x_dtype = x.dtype();
-        let x_compute = if x_dtype != target_dtype {
-            x.to_dtype(target_dtype).map_err(Error::Flame)?
-        } else {
-            x.clone()
-        };
+        let target_dtype = x_dtype;
+        let x_compute = x.clone();
 
         // Flatten leading dims: x [*..., in] → [B, num_blocks, b]
         // where B = product(*...) = numel / in.

@@ -461,16 +461,25 @@ impl LycorisModule for LoHaModule {
             return tensor_utils::zeros_bf16(Shape::from_dims(x.dims()), self.device.clone());
         }
 
-        let w1a = param_tensor(&self.w1a)?;
-        let w1b = param_tensor(&self.w1b)?;
-        let w2a = param_tensor(&self.w2a)?;
-        let w2b = param_tensor(&self.w2b)?;
+        // See `LoConModule::forward` for the dtype-coercion rationale —
+        // F32-storage params must be cast to `x.dtype()` *with autograd
+        // recording* (i.e. NOT inside `Tensor::matmul`'s no-grad auto-cast)
+        // so backward routes Cast → F32 leaf.
+        let target_dtype = x.dtype();
+        let coerce = |p: &Parameter| -> Result<Tensor> {
+            let t = param_tensor(p)?;
+            if t.dtype() != target_dtype { t.to_dtype(target_dtype).map_err(Error::Flame) } else { Ok(t) }
+        };
+        let w1a = coerce(&self.w1a)?;
+        let w1b = coerce(&self.w1b)?;
+        let w2a = coerce(&self.w2a)?;
+        let w2b = coerce(&self.w2b)?;
 
         // Compute w1 and w2 with proper operations
         if self.is_conv {
             // Conv path: use conv2d operations
             let h1 = if let Some(ref t1) = self.t1 {
-                let t1_t = param_tensor(t1)?;
+                let t1_t = coerce(t1)?;
                 // Tucker: w1a → t1 → w1b
                 let temp = crate::ops::conv2d::conv2d(
                     x,
@@ -527,7 +536,7 @@ impl LycorisModule for LoHaModule {
             };
 
             let h2 = if let Some(ref t2) = self.t2 {
-                let t2_t = param_tensor(t2)?;
+                let t2_t = coerce(t2)?;
                 // Tucker: w2a → t2 → w2b
                 let temp = crate::ops::conv2d::conv2d(
                     x,

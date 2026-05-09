@@ -371,8 +371,23 @@ impl LycorisModule for LoConModule {
             );
         }
 
-        let down_t = param_tensor(&self.down)?;
-        let up_t = param_tensor(&self.up)?;
+        // Cast F32-storage params to x.dtype() *in record mode* so backward
+        // routes gradients through Cast → F32 leaves (matches the legacy
+        // LoRALinear pattern).  Doing the dtype-coercion inside the matmul
+        // (auto-cast via `Tensor::matmul`) uses `to_dtype_no_grad`, which
+        // does NOT record a Cast op → the matmul autograd entry references
+        // a leafless BF16 tensor.  That broken sub-graph corrupts FA
+        // backward two layers up (CUDA_ERROR_MISALIGNED_ADDRESS, 2026-05-09
+        // chroma --algo locon repro).
+        let target_dtype = x.dtype();
+        let down_t = {
+            let t = param_tensor(&self.down)?;
+            if t.dtype() != target_dtype { t.to_dtype(target_dtype).map_err(Error::Flame)? } else { t }
+        };
+        let up_t = {
+            let t = param_tensor(&self.up)?;
+            if t.dtype() != target_dtype { t.to_dtype(target_dtype).map_err(Error::Flame)? } else { t }
+        };
 
         // First apply down projection (BF16 -> FP32 compute -> BF16 output)
         let h = if self.is_conv {
@@ -395,7 +410,10 @@ impl LycorisModule for LoConModule {
         // Apply mid if present (Tucker decomposition)
         let h = if let Some(ref mid) = self.mid {
             // mid: [KH, KW, RANK, RANK]
-            let mid_t = param_tensor(mid)?;
+            let mid_t = {
+                let t = param_tensor(mid)?;
+                if t.dtype() != target_dtype { t.to_dtype(target_dtype).map_err(Error::Flame)? } else { t }
+            };
             crate::ops::conv2d::conv2d(
                 &h,
                 &mid_t,
