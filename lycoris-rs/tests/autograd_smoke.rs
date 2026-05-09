@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
+use flame_core::parameter::Parameter;
 use flame_core::{DType, Shape, Tensor};
 
 use lycoris_rs::algorithms::{
@@ -81,13 +82,14 @@ fn locon_linear_autograd_records_lora_b_grad() {
     const RANK: usize = 4;
     const ALPHA: f32 = 4.0;
 
-    // Build the module with the standard constructor (no requires_grad), then
-    // overwrite the leaves with grad-enabled tensors. The LycorisModule trait's
-    // forward path only reads &self.down / &self.up, so this is safe.
+    // Build the module with the standard constructor (BF16 inference leaves
+    // wrapped in Parameter), then overwrite the leaves with grad-enabled
+    // Parameter handles. The LycorisModule forward path reads via
+    // `param.tensor()?` so the swapped-in leaf is what gets used.
     let mut m = LoConModule::new_linear(IN, OUT, RANK, Some(ALPHA), dev.clone())
         .expect("LoConModule::new_linear");
-    m.down = leaf_randn_bf16(&[IN, RANK], 0.1, dev.clone());
-    m.up   = leaf_zeros_bf16(&[RANK, OUT], dev.clone());
+    m.down = Parameter::new(leaf_randn_bf16(&[IN, RANK], 0.1, dev.clone()));
+    m.up   = Parameter::new(leaf_zeros_bf16(&[RANK, OUT], dev.clone()));
 
     // Input
     let x = leaf_randn_bf16(&[2, IN], 1.0, dev.clone());
@@ -122,11 +124,11 @@ fn loha_linear_autograd_records_w2b_grad() {
     let mut m = LoHaModule::new_linear(IN, OUT, RANK, Some(ALPHA), dev.clone())
         .expect("LoHaModule::new_linear");
     // Branch 1: fully nonzero so w1 = w1a @ w1b ≠ 0.
-    m.w1a = leaf_randn_bf16(&[IN, RANK],  1.0, dev.clone());
-    m.w1b = leaf_randn_bf16(&[RANK, OUT], 0.1, dev.clone());
+    m.w1a = Parameter::new(leaf_randn_bf16(&[IN, RANK],  1.0, dev.clone()));
+    m.w1b = Parameter::new(leaf_randn_bf16(&[RANK, OUT], 0.1, dev.clone()));
     // Branch 2: w2a random, w2b zeros — checking that grad flows to w2b.
-    m.w2a = leaf_randn_bf16(&[IN, RANK],  1.0, dev.clone());
-    m.w2b = leaf_zeros_bf16(&[RANK, OUT], dev.clone());
+    m.w2a = Parameter::new(leaf_randn_bf16(&[IN, RANK],  1.0, dev.clone()));
+    m.w2b = Parameter::new(leaf_zeros_bf16(&[RANK, OUT], dev.clone()));
 
     let x = leaf_randn_bf16(&[2, IN], 1.0, dev.clone());
 
@@ -173,11 +175,11 @@ fn lokr_linear_autograd_records_w2b_grad() {
 
     let m = LoKrModule {
         w1: None,
-        w1a: Some(w1a),
-        w1b: Some(w1b),
+        w1a: Some(Parameter::new(w1a)),
+        w1b: Some(Parameter::new(w1b)),
         w2: None,
-        w2a: Some(w2a),
-        w2b: Some(w2b),
+        w2a: Some(Parameter::new(w2a)),
+        w2b: Some(Parameter::new(w2b)),
         t2: None,
         rank: RANK,
         alpha: ALPHA,
@@ -219,17 +221,73 @@ fn full_autograd_records_diff_grad() {
     const STRENGTH: f32 = 1.5;
 
     let diff = leaf_randn_bf16(&[IN, OUT], 0.1, dev.clone());
-    let f = FullAdapter { diff: diff.clone(), diff_b: None };
+    let diff_id = diff.id();
+    let f = FullAdapter {
+        diff: Parameter::new(diff),
+        diff_b: None,
+    };
 
     // delta_weight returns strength * diff; sum it as a scalar loss.
     let delta = f.delta_weight(STRENGTH).expect("delta_weight");
     let loss = delta.to_dtype(DType::F32).expect("to F32").sum().expect("sum");
     let grads = flame_core::autograd::backward(&loss, false).expect("backward");
 
-    let g_diff = grads.get(diff.id()).expect("missing grad for diff");
+    let g_diff = grads.get(diff_id).expect("missing grad for diff");
     let mg = max_abs_host(g_diff);
     println!("[Full] grad_diff max_abs={:e}", mg);
     assert!(mg.is_finite() && mg > PASS_THRESHOLD,
         "Full: diff grad is zero / non-finite — autograd not recording");
     println!("[Full] PASS");
+}
+
+/// Phase 2b gradient-isolation regression test.
+///
+/// Verifies that calling `set_data` on a `Parameter` handle returned by
+/// `LycorisModule::parameters_handles()` actually mutates the algorithm's
+/// internal leaf storage (i.e. subsequent `forward` reads see the new data).
+/// Prior to the migration, leaves were stored as bare `Tensor` and
+/// `LycorisLinear::to_parameters` wrapped clones in fresh `Parameter`s — so
+/// optimizer `set_data` calls landed on a throwaway wrapper, never reaching
+/// the adapter, and `forward` kept reading the init values. This test fails
+/// loudly if the bug is reintroduced.
+#[test]
+fn locon_set_data_through_handle_propagates_to_forward() {
+    let Some(dev) = try_device() else { eprintln!("[locon_setdata] no CUDA — skipped"); return; };
+
+    const IN: usize = 8;
+    const OUT: usize = 8;
+    const RANK: usize = 2;
+
+    // Build the module the way EDv2 trainers do — F32 leaves via
+    // `new_linear_for_training`, then collect `Parameter` handles.
+    let m = LoConModule::new_linear_for_training(
+        IN, OUT, RANK, Some(RANK as f32), dev.clone(), lycoris_rs::tensor_utils::StorageDtype::F32,
+    ).expect("LoConModule::new_linear_for_training");
+
+    let handles = m.parameters_handles();
+    assert_eq!(handles.len(), 2, "LoCon: expected [down, up]");
+    let up_handle = handles[1].clone();
+
+    // Initial up tensor is zeros (canonical LoRA init).
+    let up_before = m.up.tensor().expect("up before");
+    let up_before_v = up_before.to_dtype(DType::F32).unwrap().to_vec().unwrap();
+    let nonzero_before = up_before_v.iter().filter(|&&x| x != 0.0).count();
+    assert_eq!(nonzero_before, 0, "up should start zero");
+
+    // Mutate via the handle (mimics AdamW8bit's update path).
+    let one_tensor = Tensor::randn(
+        Shape::from_dims(&[RANK, OUT]), 0.0, 1.0, dev.clone(),
+    ).expect("randn for set_data").to_dtype(flame_core::DType::F32).expect("F32");
+    up_handle.set_data(one_tensor).expect("set_data");
+
+    // Forward path reads via `param.tensor()?` — should see the new data.
+    let up_after = m.up.tensor().expect("up after");
+    let up_after_v = up_after.to_dtype(DType::F32).unwrap().to_vec().unwrap();
+    let nonzero_after = up_after_v.iter().filter(|&&x| x != 0.0).count();
+    assert!(
+        nonzero_after > 0,
+        "Phase 2b regression: set_data on handle did not propagate to adapter — \
+         optimizer updates would be silently dropped. nonzero_after={}", nonzero_after
+    );
+    println!("[locon_setdata] PASS: set_data via handle reached adapter (nonzero_after={})", nonzero_after);
 }

@@ -10,17 +10,25 @@
 
 use crate::{tensor_utils, Error, Result, StorageDtype};
 use cudarc::driver::CudaDevice;
+use flame_core::parameter::Parameter;
 use flame_core::{Shape, Tensor};
 use std::sync::Arc;
 
 pub struct FullAdapter {
-    /// Raw weight delta tensor, in whatever shape the base weight uses.
-    pub diff: Tensor,
-    /// Optional bias delta tensor (1D), shape matches the layer's bias if any.
+    /// Raw weight delta, wrapped in `Parameter` so the optimizer's in-place
+    /// updates are visible through any accessor that reads it. The on-disk
+    /// tensor matches the base weight shape.
+    pub diff: Parameter,
+    /// Optional bias delta (1D), shape matches the layer's bias if any.
     /// P0-7: previously `.diff_b` was silently dropped by the loader, so
     /// bias-using layers (linear projections, MLP outs, group norms) lost
     /// the bias delta entirely.
-    pub diff_b: Option<Tensor>,
+    pub diff_b: Option<Parameter>,
+}
+
+#[inline]
+fn param_tensor(p: &Parameter) -> Result<Tensor> {
+    p.tensor().map_err(Error::Flame)
 }
 
 impl FullAdapter {
@@ -47,24 +55,34 @@ impl FullAdapter {
                 device,
             )?),
         };
-        Ok(Self { diff, diff_b })
+        Ok(Self {
+            diff: Parameter::new(diff),
+            diff_b: diff_b.map(Parameter::new),
+        })
     }
 
     /// Returns `strength * diff`. Caller adds this to the base weight.
     pub fn delta_weight(&self, strength: f32) -> Result<Tensor> {
+        let diff_t = param_tensor(&self.diff)?;
         if strength == 1.0 {
             // Avoid an unnecessary scalar mul kernel.
-            return Ok(self.diff.clone());
+            return Ok(diff_t);
         }
-        self.diff.mul_scalar(strength).map_err(Error::Flame)
+        diff_t.mul_scalar(strength).map_err(Error::Flame)
     }
 
     /// Returns `Some(strength * diff_b)` when a bias delta is present.
     pub fn delta_bias(&self, strength: f32) -> Result<Option<Tensor>> {
         match &self.diff_b {
             None => Ok(None),
-            Some(b) if strength == 1.0 => Ok(Some(b.clone())),
-            Some(b) => Ok(Some(b.mul_scalar(strength).map_err(Error::Flame)?)),
+            Some(b) => {
+                let bt = param_tensor(b)?;
+                if strength == 1.0 {
+                    Ok(Some(bt))
+                } else {
+                    Ok(Some(bt.mul_scalar(strength).map_err(Error::Flame)?))
+                }
+            }
         }
     }
 
@@ -73,11 +91,21 @@ impl FullAdapter {
     /// `FullAdapter` is intentionally trait-free because it has no
     /// `forward(x)` (it's a pure weight delta), but the trainer needs the
     /// same accessor for optimizer collection.
-    pub fn parameters(&self) -> Vec<&Tensor> {
-        let mut out: Vec<&Tensor> = Vec::with_capacity(2);
-        out.push(&self.diff);
+    pub fn parameters(&self) -> Vec<Tensor> {
+        let mut out: Vec<Tensor> = Vec::with_capacity(2);
+        out.push(param_tensor(&self.diff).expect("Full.diff mutex poisoned"));
         if let Some(ref b) = self.diff_b {
-            out.push(b);
+            out.push(param_tensor(b).expect("Full.diff_b mutex poisoned"));
+        }
+        out
+    }
+
+    /// Live `Parameter` handles for optimizer collection.
+    pub fn parameters_handles(&self) -> Vec<Parameter> {
+        let mut out: Vec<Parameter> = Vec::with_capacity(2);
+        out.push(self.diff.clone());
+        if let Some(ref b) = self.diff_b {
+            out.push(b.clone());
         }
         out
     }

@@ -7,6 +7,7 @@ use crate::{tensor_utils, Error, LycorisModule, Result, StorageDtype};
 use crate::ops::kronecker::{make_kronecker, make_kronecker_conv_kernel};
 use crate::ops::tucker::rebuild_conv_tucker;
 use cudarc::driver::CudaDevice;
+use flame_core::parameter::Parameter;
 use flame_core::{DType, Shape, Tensor};
 use std::sync::Arc;
 
@@ -16,6 +17,20 @@ fn assert_bf16_storage(name: &str, t: &Tensor) -> Result<()> {
         return Err(Error::InvalidOperation(format!("{name} must use BF16 storage")));
     }
     Ok(())
+}
+
+#[inline]
+fn param_tensor(p: &Parameter) -> Result<Tensor> {
+    p.tensor().map_err(Error::Flame)
+}
+
+#[allow(dead_code)]
+#[inline]
+fn opt_param_tensor(p: &Option<Parameter>) -> Result<Option<Tensor>> {
+    match p {
+        Some(p) => Ok(Some(param_tensor(p)?)),
+        None => Ok(None),
+    }
 }
 
 /// Storage-policy-aware variant of `assert_bf16_storage`.
@@ -57,15 +72,15 @@ fn scale_from(alpha: f32, rank: usize) -> f32 {
 /// LoKr module supports either full or factorized W1/W2. For conv, W2 may be Tucker/factorized.
 pub struct LoKrModule {
     // W1 (matrix): either full [OL,IM] or factorized [OL,R]@[R,IM]
-    pub w1:  Option<Tensor>,
-    pub w1a: Option<Tensor>,
-    pub w1b: Option<Tensor>,
+    pub w1:  Option<Parameter>,
+    pub w1a: Option<Parameter>,
+    pub w1b: Option<Parameter>,
 
     // W2 (conv-style): either full [OK,IN,KH,KW], or factorized/Tucker
-    pub w2:  Option<Tensor>,   // [OK,IN,KH,KW]
-    pub w2a: Option<Tensor>,   // [OK,R]
-    pub w2b: Option<Tensor>,   // [R,IN] or [R,IN,KH,KW]
-    pub t2:  Option<Tensor>,   // [KH,KW,R,R]
+    pub w2:  Option<Parameter>,   // [OK,IN,KH,KW]
+    pub w2a: Option<Parameter>,   // [OK,R]
+    pub w2b: Option<Parameter>,   // [R,IN] or [R,IN,KH,KW]
+    pub t2:  Option<Parameter>,   // [KH,KW,R,R]
 
     pub rank: usize,
     pub alpha: f32,
@@ -242,12 +257,12 @@ impl LoKrModule {
         };
 
         Ok(Self {
-            w1,
-            w1a,
-            w1b,
-            w2,
-            w2a,
-            w2b,
+            w1: w1.map(Parameter::new),
+            w1a: w1a.map(Parameter::new),
+            w1b: w1b.map(Parameter::new),
+            w2: w2.map(Parameter::new),
+            w2a: w2a.map(Parameter::new),
+            w2b: w2b.map(Parameter::new),
             t2: None,
             rank,
             alpha,
@@ -399,13 +414,13 @@ impl LoKrModule {
         };
 
         Ok(Self {
-            w1,
-            w1a,
-            w1b,
-            w2,
-            w2a,
-            w2b,
-            t2,
+            w1: w1.map(Parameter::new),
+            w1a: w1a.map(Parameter::new),
+            w1b: w1b.map(Parameter::new),
+            w2: w2.map(Parameter::new),
+            w2a: w2a.map(Parameter::new),
+            w2b: w2b.map(Parameter::new),
+            t2: t2.map(Parameter::new),
             rank,
             alpha,
             device,
@@ -417,22 +432,26 @@ impl LoKrModule {
     /// Resolve W1 as a dense matrix [OL,IM]
     fn resolve_w1(&self) -> Result<Tensor> {
         if let Some(ref w) = self.w1 {
-            assert_bf16_storage("w1", w)?;
-            return Ok(w.clone());
+            let wt = param_tensor(w)?;
+            assert_bf16_storage("w1", &wt)?;
+            return Ok(wt);
         }
         let wa = self.w1a.as_ref().ok_or_else(|| Error::InvalidOperation("w1a missing".into()))?;
         let wb = self.w1b.as_ref().ok_or_else(|| Error::InvalidOperation("w1b missing".into()))?;
-        assert_bf16_storage("w1a", wa)?;
-        assert_bf16_storage("w1b", wb)?;
-        wa.matmul(wb).map_err(Error::Flame) // [OL,IM]
+        let wa_t = param_tensor(wa)?;
+        let wb_t = param_tensor(wb)?;
+        assert_bf16_storage("w1a", &wa_t)?;
+        assert_bf16_storage("w1b", &wb_t)?;
+        wa_t.matmul(&wb_t).map_err(Error::Flame) // [OL,IM]
     }
 
     /// Resolve W2 to a full conv kernel **in OK/IN/KH/KW order**.
     /// Returns [OK,IN,KH,KW].
     fn resolve_w2_full_ok_in_kh_kw(&self) -> Result<Tensor> {
         if let Some(ref w) = self.w2 {
-            assert_bf16_storage("w2", w)?;
-            return Ok(w.clone()); // already [OK,IN,KH,KW]
+            let wt = param_tensor(w)?;
+            assert_bf16_storage("w2", &wt)?;
+            return Ok(wt); // already [OK,IN,KH,KW]
         }
 
         // Tucker path. Upstream `lycoris.functional.lokr.weight_gen` saves
@@ -452,13 +471,16 @@ impl LoKrModule {
         if let Some(ref t) = self.t2 {
             let w2a = self.w2a.as_ref().ok_or_else(|| Error::InvalidOperation("w2a missing for Tucker".into()))?;
             let w2b = self.w2b.as_ref().ok_or_else(|| Error::InvalidOperation("w2b missing for Tucker".into()))?;
-            assert_bf16_storage("t2", t)?;
-            assert_bf16_storage("w2a", w2a)?;
-            assert_bf16_storage("w2b", w2b)?;
-            let r   = w2a.dims()[0];
-            let ok  = w2a.dims()[1];
-            let r2  = w2b.dims()[0];
-            let inn = w2b.dims()[1];
+            let t_t = param_tensor(t)?;
+            let w2a_t0 = param_tensor(w2a)?;
+            let w2b_t0 = param_tensor(w2b)?;
+            assert_bf16_storage("t2", &t_t)?;
+            assert_bf16_storage("w2a", &w2a_t0)?;
+            assert_bf16_storage("w2b", &w2b_t0)?;
+            let r   = w2a_t0.dims()[0];
+            let ok  = w2a_t0.dims()[1];
+            let r2  = w2b_t0.dims()[0];
+            let inn = w2b_t0.dims()[1];
             if r2 != r {
                 return Err(Error::InvalidOperation(format!(
                     "Tucker LoKr rank mismatch: w2a[0]={}, w2b[0]={}", r, r2
@@ -467,11 +489,11 @@ impl LoKrModule {
             // rebuild_conv_tucker expects: t:[KH,KW,R,R], down:[1,1,IC,R], up:[1,1,R,OC].
             // Here IC=IN, OC=OK. w2a is [R, OK] on disk, so transpose to [OK, R]
             // before reshaping to [1, 1, R, OK]. Same for w2b ([R, IN] → [IN, R]).
-            let w2a_t = w2a.transpose().map_err(Error::Flame)?;  // [OK, R]
-            let w2b_t = w2b.transpose().map_err(Error::Flame)?;  // [IN, R]
-            let up   = w2a_t.reshape(&[1, 1, r, ok]).map_err(Error::Flame)?;   // [1,1,R,OK]
-            let down = w2b_t.reshape(&[1, 1, inn, r]).map_err(Error::Flame)?;  // [1,1,IN,R]
-            let k_hw_ic_oc = rebuild_conv_tucker(t, &down, &up)?;              // [KH,KW,IN,OK]
+            let w2a_tt = w2a_t0.transpose().map_err(Error::Flame)?;  // [OK, R]
+            let w2b_tt = w2b_t0.transpose().map_err(Error::Flame)?;  // [IN, R]
+            let up   = w2a_tt.reshape(&[1, 1, r, ok]).map_err(Error::Flame)?;   // [1,1,R,OK]
+            let down = w2b_tt.reshape(&[1, 1, inn, r]).map_err(Error::Flame)?;  // [1,1,IN,R]
+            let k_hw_ic_oc = rebuild_conv_tucker(&t_t, &down, &up)?;            // [KH,KW,IN,OK]
             // Reorder to [OK,IN,KH,KW] for make_kronecker_conv_kernel's expected input
             return k_hw_ic_oc.permute(&[3, 2, 0, 1]).map_err(Error::Flame);
         }
@@ -481,10 +503,12 @@ impl LoKrModule {
         // w2b:[R,IN,KH,KW] (spatial)    → full:[OK,IN,KH,KW] by contracting R at each (h,w)
         let w2a = self.w2a.as_ref().ok_or_else(|| Error::InvalidOperation("w2a missing".into()))?;
         let w2b = self.w2b.as_ref().ok_or_else(|| Error::InvalidOperation("w2b missing".into()))?;
-        assert_bf16_storage("w2a", w2a)?;
-        assert_bf16_storage("w2b", w2b)?;
-        let da = w2a.dims();
-        let db = w2b.dims();
+        let w2a_t = param_tensor(w2a)?;
+        let w2b_t = param_tensor(w2b)?;
+        assert_bf16_storage("w2a", &w2a_t)?;
+        assert_bf16_storage("w2b", &w2b_t)?;
+        let da = w2a_t.dims();
+        let db = w2b_t.dims();
         let ok = da[0];
         let r  = da[1];
 
@@ -492,7 +516,7 @@ impl LoKrModule {
             2 => {
                 let inn = db[1];
                 if db[0] != r { return Err(Error::InvalidOperation("rank mismatch w2a/w2b (1x1)".into())); }
-                let ok_in = w2a.matmul(w2b).map_err(Error::Flame)?; // [OK,IN]
+                let ok_in = w2a_t.matmul(&w2b_t).map_err(Error::Flame)?; // [OK,IN]
                 ok_in.reshape(&[ok, inn, 1, 1]).map_err(Error::Flame)
             }
             4 => {
@@ -500,10 +524,10 @@ impl LoKrModule {
                 if rb != r { return Err(Error::InvalidOperation("rank mismatch w2a/w2b (spatial)".into())); }
 
                 // Reshape w2b: [R,IN,KH,KW] → [R, IN*KH*KW]
-                let w2b_flat = w2b.reshape(&[r, inn * kh * kw]).map_err(Error::Flame)?;
+                let w2b_flat = w2b_t.reshape(&[r, inn * kh * kw]).map_err(Error::Flame)?;
 
                 // Contract: [OK,R] @ [R, IN*KH*KW] → [OK, IN*KH*KW]
-                let result_flat = w2a.matmul(&w2b_flat).map_err(Error::Flame)?;
+                let result_flat = w2a_t.matmul(&w2b_flat).map_err(Error::Flame)?;
 
                 // Reshape to final: [OK, IN, KH, KW]
                 result_flat.reshape(&[ok, inn, kh, kw]).map_err(Error::Flame)
@@ -536,18 +560,21 @@ impl LycorisModule for LoKrModule {
             let w1 = self.resolve_w1()?; // [OL,IM]
             // Build W2 (linear 2D) from provided W2 state
             let w2_lin: Tensor = if let Some(ref w2_full) = self.w2 {
-                let d = w2_full.dims();
+                let w2_full_t = param_tensor(w2_full)?;
+                let d = w2_full_t.dims();
                 if d.len() == 2 {
-                    w2_full.clone()
+                    w2_full_t
                 } else if d.len() == 4 && d[2] == 1 && d[3] == 1 {
                     // [OK,IN,1,1] → [OK,IN]
-                    w2_full.reshape(&[d[0], d[1]]).map_err(Error::Flame)?
+                    w2_full_t.reshape(&[d[0], d[1]]).map_err(Error::Flame)?
                 } else {
                     return Err(Error::InvalidOperation("linear LoKr requires 2D w2 (or KH=KW=1)".into()));
                 }
             } else if let (Some(ref a), Some(ref b)) = (&self.w2a, &self.w2b) {
                 // [OK,R]@[R,IN] → [OK,IN]
-                a.matmul(b).map_err(Error::Flame)?
+                let a_t = param_tensor(a)?;
+                let b_t = param_tensor(b)?;
+                a_t.matmul(&b_t).map_err(Error::Flame)?
             } else {
                 // pure W1-only LoKr isn't meaningful for kron; bail
                 return Err(Error::InvalidOperation("missing W2 for linear LoKr".into()));
@@ -566,34 +593,32 @@ impl LycorisModule for LoKrModule {
         Ok(())
     }
 
-    fn parameters(&self) -> Vec<&Tensor> {
+    fn parameters(&self) -> Vec<Tensor> {
         // Order: [w1?, w1a?, w1b?, w2?, w2a?, w2b?, t2?]. Skip None.
         // Each LoKr instance has either `w1` (full) XOR (`w1a` & `w1b`), and
         // similarly for W2 (full / factorized / Tucker). Order inside the
         // Vec is fixed so the trainer's optimizer state pairs by index
         // across save / resume.
-        let mut out: Vec<&Tensor> = Vec::with_capacity(7);
-        if let Some(ref w) = self.w1 {
-            out.push(w);
-        }
-        if let Some(ref w) = self.w1a {
-            out.push(w);
-        }
-        if let Some(ref w) = self.w1b {
-            out.push(w);
-        }
-        if let Some(ref w) = self.w2 {
-            out.push(w);
-        }
-        if let Some(ref w) = self.w2a {
-            out.push(w);
-        }
-        if let Some(ref w) = self.w2b {
-            out.push(w);
-        }
-        if let Some(ref t) = self.t2 {
-            out.push(t);
-        }
+        let mut out: Vec<Tensor> = Vec::with_capacity(7);
+        if let Some(ref w) = self.w1 { out.push(param_tensor(w).expect("LoKr.w1 mutex")); }
+        if let Some(ref w) = self.w1a { out.push(param_tensor(w).expect("LoKr.w1a mutex")); }
+        if let Some(ref w) = self.w1b { out.push(param_tensor(w).expect("LoKr.w1b mutex")); }
+        if let Some(ref w) = self.w2 { out.push(param_tensor(w).expect("LoKr.w2 mutex")); }
+        if let Some(ref w) = self.w2a { out.push(param_tensor(w).expect("LoKr.w2a mutex")); }
+        if let Some(ref w) = self.w2b { out.push(param_tensor(w).expect("LoKr.w2b mutex")); }
+        if let Some(ref t) = self.t2 { out.push(param_tensor(t).expect("LoKr.t2 mutex")); }
+        out
+    }
+
+    fn parameters_handles(&self) -> Vec<Parameter> {
+        let mut out: Vec<Parameter> = Vec::with_capacity(7);
+        if let Some(ref w) = self.w1 { out.push(w.clone()); }
+        if let Some(ref w) = self.w1a { out.push(w.clone()); }
+        if let Some(ref w) = self.w1b { out.push(w.clone()); }
+        if let Some(ref w) = self.w2 { out.push(w.clone()); }
+        if let Some(ref w) = self.w2a { out.push(w.clone()); }
+        if let Some(ref w) = self.w2b { out.push(w.clone()); }
+        if let Some(ref t) = self.t2 { out.push(t.clone()); }
         out
     }
 }

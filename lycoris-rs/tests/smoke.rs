@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
+use flame_core::parameter::Parameter;
 use flame_core::{DType, Shape, Tensor};
 
 use lycoris_rs::algorithms::{
@@ -71,8 +72,8 @@ fn locon_linear_delta_shape_and_value() {
     let up = bf16(up_data, &[2, 8], device.clone());
 
     let m = LoConModule {
-        down,
-        up,
+        down: Parameter::new(down),
+        up: Parameter::new(up),
         mid: None,
         rank: 2,
         alpha: 2.0,
@@ -115,10 +116,10 @@ fn loha_linear_delta_shape_and_value() {
     let w2b = bf16(w2b_data, &[2, 4], device.clone());
 
     let m = LoHaModule {
-        w1a,
-        w1b,
-        w2a,
-        w2b,
+        w1a: Parameter::new(w1a),
+        w1b: Parameter::new(w1b),
+        w2a: Parameter::new(w2a),
+        w2b: Parameter::new(w2b),
         t1: None,
         t2: None,
         rank: 2,
@@ -164,10 +165,10 @@ fn lokr_linear_delta_shape_and_value() {
 
     // rank=1, alpha=1 ⇒ scale = 1.0 (so the kron values aren't scaled away).
     let m = LoKrModule {
-        w1: Some(w1),
+        w1: Some(Parameter::new(w1)),
         w1a: None,
         w1b: None,
-        w2: Some(w2),
+        w2: Some(Parameter::new(w2)),
         w2a: None,
         w2b: None,
         t2: None,
@@ -202,7 +203,10 @@ fn full_delta_shape_and_value() {
     };
 
     let diff = bf16(vec![1.0, 0.0, 0.0, 1.0], &[2, 2], device.clone());
-    let m = FullAdapter { diff, diff_b: None };
+    let m = FullAdapter {
+        diff: Parameter::new(diff),
+        diff_b: None,
+    };
 
     let dw = m.delta_weight(0.5).expect("delta weight");
     assert_eq!(dw.dims(), &[2, 2], "Full ΔW shape");
@@ -259,8 +263,8 @@ fn locon_conv2d_delta_shape_and_value() {
     let up = bf16(up_data, &[kh, kw, r, oc], device.clone());
 
     let m = LoConModule {
-        down,
-        up,
+        down: Parameter::new(down),
+        up: Parameter::new(up),
         mid: None,
         rank: r,
         alpha: r as f32, // scale = 1.0
@@ -326,9 +330,9 @@ fn locon_conv2d_tucker_works_after_p0_1_fix() {
     let up = bf16(up_data, &[1, 1, r, oc], device.clone());
 
     let m = LoConModule {
-        down,
-        up,
-        mid: Some(mid),
+        down: Parameter::new(down),
+        up: Parameter::new(up),
+        mid: Some(Parameter::new(mid)),
         rank: r,
         alpha: r as f32, // scale = 1.0
         device: device.clone(),
@@ -384,10 +388,10 @@ fn loha_conv2d_1x1_delta_shape_and_value() {
     let w2b = bf16(w2b_data, &[1, 1, r, oc], device.clone());
 
     let m = LoHaModule {
-        w1a,
-        w1b,
-        w2a,
-        w2b,
+        w1a: Parameter::new(w1a),
+        w1b: Parameter::new(w1b),
+        w2a: Parameter::new(w2a),
+        w2b: Parameter::new(w2b),
         t1: None,
         t2: None,
         rank: r,
@@ -436,10 +440,10 @@ fn lokr_conv2d_full_w2_delta_shape_and_value() {
 
     // Note: rank=0, alpha=1 — P0-4 means scale=1.0 instead of 0.0.
     let m = LoKrModule {
-        w1: Some(w1),
+        w1: Some(Parameter::new(w1)),
         w1a: None,
         w1b: None,
-        w2: Some(w2),
+        w2: Some(Parameter::new(w2)),
         w2a: None,
         w2b: None,
         t2: None,
@@ -489,10 +493,10 @@ fn lokr_linear_full_w1_full_w2_not_zero_after_p0_4_fix() {
     let w2 = bf16(vec![5.0, 6.0, 7.0, 8.0], &[2, 2], device.clone());
 
     let m = LoKrModule {
-        w1: Some(w1),
+        w1: Some(Parameter::new(w1)),
         w1a: None,
         w1b: None,
-        w2: Some(w2),
+        w2: Some(Parameter::new(w2)),
         w2a: None,
         w2b: None,
         t2: None,
@@ -527,8 +531,8 @@ fn full_adapter_diff_b_propagates_after_p0_7_fix() {
     let diff = bf16(vec![1.0, 2.0, 3.0, 4.0], &[2, 2], device.clone());
     let diff_b = bf16(vec![10.0, 20.0], &[2], device.clone());
     let m = FullAdapter {
-        diff,
-        diff_b: Some(diff_b),
+        diff: Parameter::new(diff),
+        diff_b: Some(Parameter::new(diff_b)),
     };
 
     // strength=0.5
@@ -543,7 +547,7 @@ fn full_adapter_diff_b_propagates_after_p0_7_fix() {
 
     // None case
     let m_no_bias = FullAdapter {
-        diff: bf16(vec![1.0; 4], &[2, 2], device.clone()),
+        diff: Parameter::new(bf16(vec![1.0; 4], &[2, 2], device.clone())),
         diff_b: None,
     };
     let none = m_no_bias.delta_bias(1.0).expect("delta_bias none");
@@ -590,12 +594,12 @@ fn loha_conv2d_tucker_works_after_p0_2_fix() {
     let w2b = bf16(w2b_data, &[r, out], device.clone());
 
     let m = LoHaModule {
-        w1a,
-        w1b,
-        w2a,
-        w2b,
-        t1: Some(t1),
-        t2: Some(t2),
+        w1a: Parameter::new(w1a),
+        w1b: Parameter::new(w1b),
+        w2a: Parameter::new(w2a),
+        w2b: Parameter::new(w2b),
+        t1: Some(Parameter::new(t1)),
+        t2: Some(Parameter::new(t2)),
         rank: r,
         alpha: r as f32, // scale=1.0
         device: device.clone(),

@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cudarc::driver::CudaDevice;
+use flame_core::parameter::Parameter;
 use flame_core::{serialization::load_file, DType, Tensor};
 
 use lycoris_rs::algorithms::full::FullAdapter;
@@ -93,8 +94,8 @@ fn parity_locon_linear() {
     let up_rust = to_bf16(&up_py.transpose().expect("up transpose"));
 
     let module = LoConModule {
-        down: down_rust,
-        up: up_rust,
+        down: Parameter::new(down_rust),
+        up: Parameter::new(up_rust),
         mid: None,
         rank: 2,
         alpha: 2.0,
@@ -130,7 +131,10 @@ fn parity_loha_linear() {
     let w2b = to_bf16(&w2u.transpose().expect("w2b transpose"));
 
     let module = LoHaModule {
-        w1a, w1b, w2a, w2b,
+        w1a: Parameter::new(w1a),
+        w1b: Parameter::new(w1b),
+        w2a: Parameter::new(w2a),
+        w2b: Parameter::new(w2b),
         t1: None,
         t2: None,
         rank: 2,
@@ -161,7 +165,7 @@ fn parity_lokr_linear_full() {
     let delta_py = py.get("delta").expect("delta");
 
     let module = LoKrModule {
-        w1: Some(w1),
+        w1: Some(Parameter::new(w1)),
         w1a: None,
         w1b: None,
         w2: None,  // full W2 stored as a "conv" tensor [OK,IN,KH,KW]; for linear we use w2_lin via w2a/w2b? Hmm.
@@ -209,7 +213,10 @@ fn parity_full_linear() {
     let py = load_ref("full_linear", dev.clone());
 
     let diff = to_bf16(py.get("diff").expect("diff"));
-    let adapter = FullAdapter { diff, diff_b: None };
+    let adapter = FullAdapter {
+        diff: Parameter::new(diff),
+        diff_b: None,
+    };
     let delta_rust = adapter.delta_weight(1.0).expect("delta_weight");
 
     let g = to_f32_vec(&delta_rust);

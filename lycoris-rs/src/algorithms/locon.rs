@@ -9,6 +9,7 @@
 
 use crate::{tensor_utils, Error, LycorisModule, Result, StorageDtype};
 use cudarc::driver::CudaDevice;
+use flame_core::parameter::Parameter;
 use flame_core::{DType, Shape, Tensor};
 use std::sync::Arc;
 
@@ -16,18 +17,20 @@ pub struct LoConModule {
     /// Down projection
     /// Linear: [IN, RANK]
     /// Conv: [KH, KW, IC, RANK] or [1, 1, IC, RANK] for 1×1
-    /// Stored in BF16
-    pub down: Tensor,
+    /// Stored in BF16 (inference) or F32 (training); see `StorageDtype`.
+    /// Wrapped in `Parameter` so the optimizer's in-place updates are
+    /// visible through `forward` (which reads via `param.tensor()?`).
+    pub down: Parameter,
 
     /// Up projection
     /// Linear: [RANK, OUT]
     /// Conv: [KH, KW, RANK, OC] or [1, 1, RANK, OC] for 1×1
-    /// Stored in BF16, initialized to zero
-    pub up: Tensor,
+    /// Initialized to zero so the initial adapter delta is exactly 0.
+    pub up: Parameter,
 
     /// Tucker core tensor for Conv with kernel > 1
-    /// [KH, KW, RANK, RANK], Optional, BF16
-    pub mid: Option<Tensor>,
+    /// [KH, KW, RANK, RANK], Optional
+    pub mid: Option<Parameter>,
 
     /// Rank of the decomposition
     pub rank: usize,
@@ -53,6 +56,13 @@ fn assert_bf16_storage(name: &str, t: &Tensor) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Read the inner tensor from a Parameter, surfacing the mutex-poisoned case
+/// as our crate `Error` rather than the raw flame_core error.
+#[inline]
+fn param_tensor(p: &Parameter) -> Result<Tensor> {
+    p.tensor().map_err(Error::Flame)
 }
 
 /// Convert a linear [IN, OUT] weight to a 1×1 conv kernel [KH,KW,IC,OC] without copy.
@@ -106,8 +116,8 @@ impl LoConModule {
         assert_bf16_storage("up", &up)?;
 
         Ok(Self {
-            down,
-            up,
+            down: Parameter::new(down),
+            up: Parameter::new(up),
             mid: None,
             rank,
             alpha,
@@ -196,9 +206,9 @@ impl LoConModule {
         }
 
         Ok(Self {
-            down,
-            up,
-            mid,
+            down: Parameter::new(down),
+            up: Parameter::new(up),
+            mid: mid.map(Parameter::new),
             rank,
             alpha,
             device,
@@ -236,8 +246,8 @@ impl LoConModule {
         )?;
 
         Ok(Self {
-            down,
-            up,
+            down: Parameter::new(down),
+            up: Parameter::new(up),
             mid: None,
             rank,
             alpha,
@@ -316,9 +326,9 @@ impl LoConModule {
         };
 
         Ok(Self {
-            down,
-            up,
-            mid,
+            down: Parameter::new(down),
+            up: Parameter::new(up),
+            mid: mid.map(Parameter::new),
             rank,
             alpha,
             device,
@@ -361,13 +371,16 @@ impl LycorisModule for LoConModule {
             );
         }
 
+        let down_t = param_tensor(&self.down)?;
+        let up_t = param_tensor(&self.up)?;
+
         // First apply down projection (BF16 -> FP32 compute -> BF16 output)
         let h = if self.is_conv {
             // Conv2d operation with explicit parameters
             // down: [KH, KW, IC, RANK] or [1, 1, IC, RANK]
             crate::ops::conv2d::conv2d(
                 x,
-                &self.down,
+                &down_t,
                 /*stride=*/ (1, 1),
                 /*padding=*/ (0, 0),
                 /*dilation=*/ (1, 1),
@@ -376,15 +389,16 @@ impl LycorisModule for LoConModule {
             )?
         } else {
             // Linear operation: x[..., IN] @ down[IN, RANK] -> [..., RANK]
-            x.matmul(&self.down).map_err(Error::Flame)?
+            x.matmul(&down_t).map_err(Error::Flame)?
         };
 
         // Apply mid if present (Tucker decomposition)
         let h = if let Some(ref mid) = self.mid {
             // mid: [KH, KW, RANK, RANK]
+            let mid_t = param_tensor(mid)?;
             crate::ops::conv2d::conv2d(
                 &h,
-                mid,
+                &mid_t,
                 (1, 1),
                 (0, 0),
                 (1, 1),
@@ -400,7 +414,7 @@ impl LycorisModule for LoConModule {
             // up: [KH, KW, RANK, OC] or [1, 1, RANK, OC]
             crate::ops::conv2d::conv2d(
                 &h,
-                &self.up,
+                &up_t,
                 (1, 1),
                 (0, 0),
                 (1, 1),
@@ -409,7 +423,7 @@ impl LycorisModule for LoConModule {
             )?
         } else {
             // h[..., RANK] @ up[RANK, OUT] -> [..., OUT]
-            h.matmul(&self.up).map_err(Error::Flame)?
+            h.matmul(&up_t).map_err(Error::Flame)?
         };
 
         // Apply scale
@@ -418,17 +432,19 @@ impl LycorisModule for LoConModule {
 
     fn get_diff_weight(&self) -> Result<Tensor> {
         let scale = self.scale();
+        let down_t = param_tensor(&self.down)?;
+        let up_t = param_tensor(&self.up)?;
 
         // Early exit for zero scale
         if scale == 0.0 {
             return if self.is_conv {
                 tensor_utils::zeros_bf16(
-                    self.up.shape().clone(),
+                    up_t.shape().clone(),
                     self.device.clone(),
                 )
             } else {
                 tensor_utils::zeros_bf16(
-                    Shape::from_dims(&[self.down.dims()[0], self.up.dims()[1]]),
+                    Shape::from_dims(&[down_t.dims()[0], up_t.dims()[1]]),
                     self.device.clone(),
                 )
             };
@@ -439,12 +455,13 @@ impl LycorisModule for LoConModule {
             if let Some(ref mid) = self.mid {
                 // Tucker reconstruction: mid[KH,KW,R,R], down[1,1,IC,R], up[1,1,R,OC]
                 // → kernel [KH,KW,IC,OC], then apply scale.
-                let kernel = crate::ops::tucker::rebuild_conv_tucker(mid, &self.down, &self.up)?;
+                let mid_t = param_tensor(mid)?;
+                let kernel = crate::ops::tucker::rebuild_conv_tucker(&mid_t, &down_t, &up_t)?;
                 return kernel.mul_scalar(scale).map_err(Error::Flame);
             } else {
                 // Standard LoRA conv
-                let down_dims = self.down.dims();
-                let up_dims = self.up.dims();
+                let down_dims = down_t.dims();
+                let up_dims = up_t.dims();
 
                 // For 1×1: down:[1,1,IC,R], up:[1,1,R,OC]
                 if down_dims[0] == 1 && down_dims[1] == 1 && up_dims[0] == 1 && up_dims[1] == 1 {
@@ -452,8 +469,8 @@ impl LycorisModule for LoConModule {
                     let ic = down_dims[2];
                     let r = down_dims[3];
                     let oc = up_dims[3];
-                    let down_lin = self.down.reshape(&[ic, r]).map_err(Error::Flame)?;
-                    let up_lin = self.up.reshape(&[r, oc]).map_err(Error::Flame)?;
+                    let down_lin = down_t.reshape(&[ic, r]).map_err(Error::Flame)?;
+                    let up_lin = up_t.reshape(&[r, oc]).map_err(Error::Flame)?;
                     let k_lin = down_lin.matmul(&up_lin).map_err(Error::Flame)?; // [IC,OC]
                     let k = k_lin.reshape(&[1, 1, ic, oc]).map_err(Error::Flame)?;
                     return k.mul_scalar(scale).map_err(Error::Flame);
@@ -467,8 +484,8 @@ impl LycorisModule for LoConModule {
                     let oc = up_dims[3];
 
                     // Reshape for batch matmul: [KH*KW, IC, R] @ [KH*KW, R, OC] -> [KH*KW, IC, OC]
-                    let down_batch = self.down.reshape(&[kh * kw, ic, r]).map_err(Error::Flame)?;
-                    let up_batch = self.up.reshape(&[kh * kw, r, oc]).map_err(Error::Flame)?;
+                    let down_batch = down_t.reshape(&[kh * kw, ic, r]).map_err(Error::Flame)?;
+                    let up_batch = up_t.reshape(&[kh * kw, r, oc]).map_err(Error::Flame)?;
 
                     // Batch matmul
                     let result_batch = down_batch.matmul(&up_batch).map_err(Error::Flame)?;
@@ -481,7 +498,7 @@ impl LycorisModule for LoConModule {
         } else {
             // Linear: ΔW = down @ up → [IN, OUT]
             // down: [IN, RANK], up: [RANK, OUT]
-            let diff = self.down.matmul(&self.up).map_err(Error::Flame)?;
+            let diff = down_t.matmul(&up_t).map_err(Error::Flame)?;
             diff.mul_scalar(scale).map_err(Error::Flame)
         }
     }
@@ -499,13 +516,29 @@ impl LycorisModule for LoConModule {
         Ok(())
     }
 
-    fn parameters(&self) -> Vec<&Tensor> {
+    fn parameters(&self) -> Vec<Tensor> {
         // Order: [down, up, mid?]. Trainer pairs optimizer state by index.
-        let mut out: Vec<&Tensor> = Vec::with_capacity(3);
-        out.push(&self.down);
-        out.push(&self.up);
+        // Each `Tensor` is a clone of the live `Parameter` storage with
+        // matching `TensorId`, so autograd grads route back to the param.
+        let mut out: Vec<Tensor> = Vec::with_capacity(3);
+        out.push(param_tensor(&self.down).expect("LoCon.down mutex poisoned"));
+        out.push(param_tensor(&self.up).expect("LoCon.up mutex poisoned"));
         if let Some(ref m) = self.mid {
-            out.push(m);
+            out.push(param_tensor(m).expect("LoCon.mid mutex poisoned"));
+        }
+        out
+    }
+
+    fn parameters_handles(&self) -> Vec<Parameter> {
+        // Live `Parameter` handles in the same order as `parameters()`.
+        // Cloning a `Parameter` is an `Arc` bump; the optimizer mutates
+        // the inner storage in-place, so subsequent `forward` calls see
+        // the updated weights.
+        let mut out: Vec<Parameter> = Vec::with_capacity(3);
+        out.push(self.down.clone());
+        out.push(self.up.clone());
+        if let Some(ref m) = self.mid {
+            out.push(m.clone());
         }
         out
     }
@@ -525,8 +558,12 @@ mod tests {
     fn test_scale_zero_rank() {
         let device = CudaDevice::new(0).unwrap();
         let module = LoConModule {
-            down: tensor_utils::zeros_bf16(Shape::from_dims(&[4, 0]), device.clone()).unwrap(),
-            up: tensor_utils::zeros_bf16(Shape::from_dims(&[0, 8]), device.clone()).unwrap(),
+            down: Parameter::new(
+                tensor_utils::zeros_bf16(Shape::from_dims(&[4, 0]), device.clone()).unwrap(),
+            ),
+            up: Parameter::new(
+                tensor_utils::zeros_bf16(Shape::from_dims(&[0, 8]), device.clone()).unwrap(),
+            ),
             mid: None,
             rank: 0,
             alpha: 1.0,

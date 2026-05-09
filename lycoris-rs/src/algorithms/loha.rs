@@ -9,37 +9,32 @@
 
 use crate::{tensor_utils, Error, LycorisModule, Result, StorageDtype};
 use cudarc::driver::CudaDevice;
+use flame_core::parameter::Parameter;
 use flame_core::{DType, Shape, Tensor};
 use std::sync::Arc;
 
 pub struct LoHaModule {
     /// First down projection (w1a)
     /// Linear: [IN, RANK], Conv: [KH, KW, IC, RANK] or [1, 1, IC, RANK]
-    /// BF16 storage
-    pub w1a: Tensor,
+    pub w1a: Parameter,
 
     /// First up projection (w1b)
     /// Linear: [RANK, OUT], Conv: [KH, KW, RANK, OC] or [1, 1, RANK, OC]
-    /// BF16 storage
-    pub w1b: Tensor,
+    pub w1b: Parameter,
 
     /// Second down projection (w2a)
     /// Linear: [IN, RANK], Conv: [KH, KW, IC, RANK] or [1, 1, IC, RANK]
-    /// BF16 storage
-    pub w2a: Tensor,
+    pub w2a: Parameter,
 
     /// Second up projection (w2b)
     /// Linear: [RANK, OUT], Conv: [KH, KW, RANK, OC] or [1, 1, RANK, OC]
-    /// BF16 storage
-    pub w2b: Tensor,
+    pub w2b: Parameter,
 
     /// Tucker core 1 (optional): [KH, KW, RANK, RANK]
-    /// BF16 storage
-    pub t1: Option<Tensor>,
+    pub t1: Option<Parameter>,
 
     /// Tucker core 2 (optional): [KH, KW, RANK, RANK]
-    /// BF16 storage
-    pub t2: Option<Tensor>,
+    pub t2: Option<Parameter>,
 
     /// Rank of the decomposition
     pub rank: usize,
@@ -65,6 +60,11 @@ fn assert_bf16_storage(name: &str, t: &Tensor) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[inline]
+fn param_tensor(p: &Parameter) -> Result<Tensor> {
+    p.tensor().map_err(Error::Flame)
 }
 
 impl LoHaModule {
@@ -121,10 +121,10 @@ impl LoHaModule {
         assert_bf16_storage("w2b", &w2b)?;
 
         Ok(Self {
-            w1a,
-            w1b,
-            w2a,
-            w2b,
+            w1a: Parameter::new(w1a),
+            w1b: Parameter::new(w1b),
+            w2a: Parameter::new(w2a),
+            w2b: Parameter::new(w2b),
             t1: None,
             t2: None,
             rank,
@@ -260,12 +260,12 @@ impl LoHaModule {
         }
 
         Ok(Self {
-            w1a,
-            w1b,
-            w2a,
-            w2b,
-            t1,
-            t2,
+            w1a: Parameter::new(w1a),
+            w1b: Parameter::new(w1b),
+            w2a: Parameter::new(w2a),
+            w2b: Parameter::new(w2b),
+            t1: t1.map(Parameter::new),
+            t2: t2.map(Parameter::new),
             rank,
             alpha,
             device,
@@ -321,10 +321,10 @@ impl LoHaModule {
         )?;
 
         Ok(Self {
-            w1a,
-            w1b,
-            w2a,
-            w2b,
+            w1a: Parameter::new(w1a),
+            w1b: Parameter::new(w1b),
+            w2a: Parameter::new(w2a),
+            w2b: Parameter::new(w2b),
             t1: None,
             t2: None,
             rank,
@@ -416,12 +416,12 @@ impl LoHaModule {
         };
 
         Ok(Self {
-            w1a,
-            w1b,
-            w2a,
-            w2b,
-            t1,
-            t2,
+            w1a: Parameter::new(w1a),
+            w1b: Parameter::new(w1b),
+            w2a: Parameter::new(w2a),
+            w2b: Parameter::new(w2b),
+            t1: t1.map(Parameter::new),
+            t2: t2.map(Parameter::new),
             rank,
             alpha,
             device,
@@ -461,14 +461,20 @@ impl LycorisModule for LoHaModule {
             return tensor_utils::zeros_bf16(Shape::from_dims(x.dims()), self.device.clone());
         }
 
+        let w1a = param_tensor(&self.w1a)?;
+        let w1b = param_tensor(&self.w1b)?;
+        let w2a = param_tensor(&self.w2a)?;
+        let w2b = param_tensor(&self.w2b)?;
+
         // Compute w1 and w2 with proper operations
         if self.is_conv {
             // Conv path: use conv2d operations
             let h1 = if let Some(ref t1) = self.t1 {
+                let t1_t = param_tensor(t1)?;
                 // Tucker: w1a → t1 → w1b
                 let temp = crate::ops::conv2d::conv2d(
                     x,
-                    &self.w1a,
+                    &w1a,
                     (1, 1),
                     (0, 0),
                     (1, 1),
@@ -478,7 +484,7 @@ impl LycorisModule for LoHaModule {
                 ?;
                 let temp = crate::ops::conv2d::conv2d(
                     &temp,
-                    t1,
+                    &t1_t,
                     (1, 1),
                     (0, 0),
                     (1, 1),
@@ -488,7 +494,7 @@ impl LycorisModule for LoHaModule {
                 ?;
                 crate::ops::conv2d::conv2d(
                     &temp,
-                    &self.w1b,
+                    &w1b,
                     (1, 1),
                     (0, 0),
                     (1, 1),
@@ -500,7 +506,7 @@ impl LycorisModule for LoHaModule {
                 // Direct: w1a → w1b
                 let temp = crate::ops::conv2d::conv2d(
                     x,
-                    &self.w1a,
+                    &w1a,
                     (1, 1),
                     (0, 0),
                     (1, 1),
@@ -510,7 +516,7 @@ impl LycorisModule for LoHaModule {
                 ?;
                 crate::ops::conv2d::conv2d(
                     &temp,
-                    &self.w1b,
+                    &w1b,
                     (1, 1),
                     (0, 0),
                     (1, 1),
@@ -521,10 +527,11 @@ impl LycorisModule for LoHaModule {
             };
 
             let h2 = if let Some(ref t2) = self.t2 {
+                let t2_t = param_tensor(t2)?;
                 // Tucker: w2a → t2 → w2b
                 let temp = crate::ops::conv2d::conv2d(
                     x,
-                    &self.w2a,
+                    &w2a,
                     (1, 1),
                     (0, 0),
                     (1, 1),
@@ -534,7 +541,7 @@ impl LycorisModule for LoHaModule {
                 ?;
                 let temp = crate::ops::conv2d::conv2d(
                     &temp,
-                    t2,
+                    &t2_t,
                     (1, 1),
                     (0, 0),
                     (1, 1),
@@ -544,7 +551,7 @@ impl LycorisModule for LoHaModule {
                 ?;
                 crate::ops::conv2d::conv2d(
                     &temp,
-                    &self.w2b,
+                    &w2b,
                     (1, 1),
                     (0, 0),
                     (1, 1),
@@ -556,7 +563,7 @@ impl LycorisModule for LoHaModule {
                 // Direct: w2a → w2b
                 let temp = crate::ops::conv2d::conv2d(
                     x,
-                    &self.w2a,
+                    &w2a,
                     (1, 1),
                     (0, 0),
                     (1, 1),
@@ -566,7 +573,7 @@ impl LycorisModule for LoHaModule {
                 ?;
                 crate::ops::conv2d::conv2d(
                     &temp,
-                    &self.w2b,
+                    &w2b,
                     (1, 1),
                     (0, 0),
                     (1, 1),
@@ -581,8 +588,8 @@ impl LycorisModule for LoHaModule {
             result.mul_scalar(scale).map_err(Error::Flame)
         } else {
             // Linear path: w1 = w1a @ w1b, w2 = w2a @ w2b
-            let w1 = self.w1a.matmul(&self.w1b)?;
-            let w2 = self.w2a.matmul(&self.w2b)?;
+            let w1 = w1a.matmul(&w1b)?;
+            let w2 = w2a.matmul(&w2b)?;
 
             // Hadamard product
             let diff_w = w1.mul(&w2)?;
@@ -595,14 +602,18 @@ impl LycorisModule for LoHaModule {
 
     fn get_diff_weight(&self) -> Result<Tensor> {
         let scale = self.scale();
+        let w1a = param_tensor(&self.w1a)?;
+        let w1b = param_tensor(&self.w1b)?;
+        let w2a = param_tensor(&self.w2a)?;
+        let w2b = param_tensor(&self.w2b)?;
 
         // Early exit for zero scale
         if scale == 0.0 {
             return if self.is_conv {
-                tensor_utils::zeros_bf16(self.w1b.shape().clone(), self.device.clone())
+                tensor_utils::zeros_bf16(w1b.shape().clone(), self.device.clone())
             } else {
                 tensor_utils::zeros_bf16(
-                    Shape::from_dims(&[self.w1a.dims()[0], self.w1b.dims()[1]]),
+                    Shape::from_dims(&[w1a.dims()[0], w1b.dims()[1]]),
                     self.device.clone(),
                 )
             };
@@ -611,24 +622,26 @@ impl LycorisModule for LoHaModule {
         if self.is_conv {
             // Conv path
             if let (Some(ref t1), Some(ref t2)) = (&self.t1, &self.t2) {
+                let t1_t = param_tensor(t1)?;
+                let t2_t = param_tensor(t2)?;
                 // Tucker path: need full reconstruction
                 // For now, use simplified approach via hadamard op
                 crate::ops::hadamard::make_hadamard_weight_tucker(
-                    t1, &self.w1a, &self.w1b, t2, &self.w2a, &self.w2b, scale,
+                    &t1_t, &w1a, &w1b, &t2_t, &w2a, &w2b, scale,
                 )
             } else {
                 // Standard conv: compute kernel via hadamard
-                let dims = self.w1a.dims();
+                let dims = w1a.dims();
                 if dims[0] == 1 && dims[1] == 1 {
                     // 1×1 case: can use linear math
                     let ic = dims[2];
                     let r = dims[3];
-                    let oc = self.w1b.dims()[3];
+                    let oc = w1b.dims()[3];
 
-                    let w1a_lin = self.w1a.reshape(&[ic, r])?;
-                    let w1b_lin = self.w1b.reshape(&[r, oc])?;
-                    let w2a_lin = self.w2a.reshape(&[ic, r])?;
-                    let w2b_lin = self.w2b.reshape(&[r, oc])?;
+                    let w1a_lin = w1a.reshape(&[ic, r])?;
+                    let w1b_lin = w1b.reshape(&[r, oc])?;
+                    let w2a_lin = w2a.reshape(&[ic, r])?;
+                    let w2b_lin = w2b.reshape(&[r, oc])?;
 
                     let w1 = w1a_lin.matmul(&w1b_lin)?;
                     let w2 = w2a_lin.matmul(&w2b_lin)?;
@@ -638,14 +651,14 @@ impl LycorisModule for LoHaModule {
                 } else {
                     // Spatial case: use hadamard op
                     crate::ops::hadamard::make_hadamard_weight(
-                        &self.w1a, &self.w1b, &self.w2a, &self.w2b, scale,
+                        &w1a, &w1b, &w2a, &w2b, scale,
                     )
                 }
             }
         } else {
             // Linear: w1 = w1a @ w1b, w2 = w2a @ w2b, diff = w1 ⊙ w2
-            let w1 = self.w1a.matmul(&self.w1b)?;
-            let w2 = self.w2a.matmul(&self.w2b)?;
+            let w1 = w1a.matmul(&w1b)?;
+            let w2 = w2a.matmul(&w2b)?;
             let diff = w1.mul(&w2)?;
             diff.mul_scalar(scale).map_err(Error::Flame)
         }
@@ -660,18 +673,33 @@ impl LycorisModule for LoHaModule {
         Ok(())
     }
 
-    fn parameters(&self) -> Vec<&Tensor> {
+    fn parameters(&self) -> Vec<Tensor> {
         // Order: [w1a, w1b, w2a, w2b, t1?, t2?]. See LycorisModule docs.
-        let mut out: Vec<&Tensor> = Vec::with_capacity(6);
-        out.push(&self.w1a);
-        out.push(&self.w1b);
-        out.push(&self.w2a);
-        out.push(&self.w2b);
+        let mut out: Vec<Tensor> = Vec::with_capacity(6);
+        out.push(param_tensor(&self.w1a).expect("LoHa.w1a mutex poisoned"));
+        out.push(param_tensor(&self.w1b).expect("LoHa.w1b mutex poisoned"));
+        out.push(param_tensor(&self.w2a).expect("LoHa.w2a mutex poisoned"));
+        out.push(param_tensor(&self.w2b).expect("LoHa.w2b mutex poisoned"));
         if let Some(ref t) = self.t1 {
-            out.push(t);
+            out.push(param_tensor(t).expect("LoHa.t1 mutex poisoned"));
         }
         if let Some(ref t) = self.t2 {
-            out.push(t);
+            out.push(param_tensor(t).expect("LoHa.t2 mutex poisoned"));
+        }
+        out
+    }
+
+    fn parameters_handles(&self) -> Vec<Parameter> {
+        let mut out: Vec<Parameter> = Vec::with_capacity(6);
+        out.push(self.w1a.clone());
+        out.push(self.w1b.clone());
+        out.push(self.w2a.clone());
+        out.push(self.w2b.clone());
+        if let Some(ref t) = self.t1 {
+            out.push(t.clone());
+        }
+        if let Some(ref t) = self.t2 {
+            out.push(t.clone());
         }
         out
     }
@@ -691,10 +719,18 @@ mod tests {
     fn test_scale_zero_rank() {
         let device = CudaDevice::new(0).unwrap();
         let module = LoHaModule {
-            w1a: tensor_utils::zeros_bf16(Shape::from_dims(&[4, 0]), device.clone()).unwrap(),
-            w1b: tensor_utils::zeros_bf16(Shape::from_dims(&[0, 8]), device.clone()).unwrap(),
-            w2a: tensor_utils::zeros_bf16(Shape::from_dims(&[4, 0]), device.clone()).unwrap(),
-            w2b: tensor_utils::zeros_bf16(Shape::from_dims(&[0, 8]), device.clone()).unwrap(),
+            w1a: Parameter::new(
+                tensor_utils::zeros_bf16(Shape::from_dims(&[4, 0]), device.clone()).unwrap(),
+            ),
+            w1b: Parameter::new(
+                tensor_utils::zeros_bf16(Shape::from_dims(&[0, 8]), device.clone()).unwrap(),
+            ),
+            w2a: Parameter::new(
+                tensor_utils::zeros_bf16(Shape::from_dims(&[4, 0]), device.clone()).unwrap(),
+            ),
+            w2b: Parameter::new(
+                tensor_utils::zeros_bf16(Shape::from_dims(&[0, 8]), device.clone()).unwrap(),
+            ),
             t1: None,
             t2: None,
             rank: 0,

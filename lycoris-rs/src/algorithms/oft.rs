@@ -57,6 +57,7 @@
 use crate::tensor_utils::StorageDtype;
 use crate::{Error, LycorisModule, Result};
 use cudarc::driver::CudaDevice;
+use flame_core::parameter::Parameter;
 use flame_core::{DType, Shape, Tensor};
 use std::sync::Arc;
 
@@ -64,7 +65,8 @@ use std::sync::Arc;
 pub struct OFTModule {
     /// Trainable rotation parameter, F32 storage. Shape `[num_blocks, b, b]`.
     /// Initialized to zeros so `R = I` and forward is identity at step 0.
-    pub blocks: Tensor,
+    /// Wrapped in `Parameter` so optimizer mutations are visible to forward.
+    pub blocks: Parameter,
 
     /// Block edge length (the `b` in `[b, b]`).
     pub block_size: usize,
@@ -102,6 +104,11 @@ pub struct OFTModule {
 
     /// Device handle (kept for potential future allocations / merge ops).
     pub device: Arc<CudaDevice>,
+}
+
+#[inline]
+fn param_tensor(p: &Parameter) -> Result<Tensor> {
+    p.tensor().map_err(Error::Flame)
 }
 
 #[inline]
@@ -178,16 +185,19 @@ impl OFTModule {
         let num_blocks = check_divisibility(in_features, block_size)?;
 
         // F32 storage for `blocks` per the precision rationale in the module
-        // docstring (Neumann accumulation eats BF16 mantissa).
+        // docstring (Neumann accumulation eats BF16 mantissa). Mark
+        // requires_grad so autograd records updates; the trainer wraps this
+        // tensor in a Parameter so the optimizer's set_data lands here.
         let blocks = Tensor::zeros_dtype(
             Shape::from_dims(&[num_blocks, block_size, block_size]),
             DType::F32,
             device.clone(),
         )
-        .map_err(Error::Flame)?;
+        .map_err(Error::Flame)?
+        .requires_grad_(true);
 
         Ok(Self {
-            blocks,
+            blocks: Parameter::new(blocks),
             block_size,
             num_blocks,
             in_features,
@@ -210,9 +220,10 @@ impl OFTModule {
     /// Compute the per-block skew-symmetric matrix `Q_skew = blocks − blocks^T`.
     /// Always F32. Shape `[num_blocks, b, b]`.
     fn skew(&self) -> Result<Tensor> {
+        let blocks = param_tensor(&self.blocks)?;
         // transpose_batch swaps the last two dims for a 3D tensor.
-        let bt = self.blocks.transpose_batch().map_err(Error::Flame)?;
-        self.blocks.sub(&bt).map_err(Error::Flame)
+        let bt = blocks.transpose_batch().map_err(Error::Flame)?;
+        blocks.sub(&bt).map_err(Error::Flame)
     }
 
     /// Build the rotation `R` via Cayley-Neumann. F32 throughout. Shape
@@ -360,7 +371,8 @@ impl OFTModule {
     /// init and acts as identity). For diagnostics only — does an O(num_elems)
     /// host-side scan.
     pub fn is_identity_init(&self) -> Result<bool> {
-        let v = self.blocks.to_vec().map_err(Error::Flame)?;
+        let blocks = param_tensor(&self.blocks)?;
+        let v = blocks.to_vec().map_err(Error::Flame)?;
         Ok(v.iter().all(|x| *x == 0.0))
     }
 }
@@ -408,13 +420,16 @@ impl LycorisModule for OFTModule {
         ))
     }
 
-    fn parameters(&self) -> Vec<&Tensor> {
+    fn parameters(&self) -> Vec<Tensor> {
         // OFT trains a single leaf: the [num_blocks, b, b] block tensor.
-        // Stored as F32 with `requires_grad=true` (Tensor::zeros_dtype default
-        // policy in the constructor — caller may need to flip the grad flag
-        // depending on how `zeros_dtype` initializes it; see lib.rs trait
-        // contract for the legacy BF16 path).
-        vec![&self.blocks]
+        // Stored as F32 with `requires_grad=true`; clone is cheap (shared
+        // GPU storage via Arc) and preserves TensorId so autograd grads
+        // route back to the live `Parameter`.
+        vec![param_tensor(&self.blocks).expect("OFT.blocks mutex poisoned")]
+    }
+
+    fn parameters_handles(&self) -> Vec<Parameter> {
+        vec![self.blocks.clone()]
     }
 }
 

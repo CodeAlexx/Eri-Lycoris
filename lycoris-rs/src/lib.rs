@@ -24,6 +24,7 @@ pub use tensor_utils::StorageDtype;
 
 // Re-export core Flame types
 pub use flame_core::{Tensor, Shape, Device};
+pub use flame_core::parameter::Parameter;
 
 // Re-export adapter structs
 pub use algorithms::full::FullAdapter;
@@ -64,7 +65,21 @@ pub trait LycorisModule {
     /// constructed via the `*_param` / `_for_training` helpers; legacy
     /// loader-only adapters (BF16 storage, `requires_grad=false`) still
     /// surface here so the trainer can detect the policy mismatch.
-    fn parameters(&self) -> Vec<&Tensor>;
+    ///
+    /// Each returned `Tensor` is a clone of the inner storage held by a
+    /// `Parameter`. The clone preserves `TensorId` and `requires_grad`, so
+    /// autograd correctly attributes gradients back to the parameter. Use
+    /// [`parameters_handles`](Self::parameters_handles) when you need the
+    /// `Parameter` wrapper itself (e.g. for the AdamW step path).
+    fn parameters(&self) -> Vec<Tensor>;
+
+    /// Trainable leaf **handles** (shared `Arc<Mutex<Tensor>>` wrappers) in
+    /// the same stable order as [`parameters`](Self::parameters). Cloning a
+    /// `Parameter` is cheap (Arc bump). The optimizer mutates each handle
+    /// in-place via `Parameter::set_data` / `with_data_mut`; subsequent
+    /// `Parameter::tensor()` reads return the updated storage, so forward
+    /// passes pick up the new weights without any synchronization step.
+    fn parameters_handles(&self) -> Vec<Parameter>;
 }
 
 /// Top-level adapter variant — one entry per Kohya/LyCORIS prefix in a
@@ -97,13 +112,31 @@ impl LycorisAdapter {
     /// Trainable leaves for this adapter, in the order documented on
     /// `LycorisModule::parameters`. Used by trainers to register adapter
     /// tensors with the optimizer.
-    pub fn parameters(&self) -> Vec<&Tensor> {
+    ///
+    /// Returned tensors are cheap clones of the underlying `Parameter`'s
+    /// data (preserving `TensorId` and `requires_grad`); they are *not*
+    /// the live in-place storage. For optimizer-driven mutation use
+    /// [`parameters_handles`](Self::parameters_handles).
+    pub fn parameters(&self) -> Vec<Tensor> {
         match self {
             LycorisAdapter::LoCon(m) => m.parameters(),
             LycorisAdapter::LoHa(m)  => m.parameters(),
             LycorisAdapter::LoKr(m)  => m.parameters(),
             LycorisAdapter::Full(m)  => m.parameters(),
             LycorisAdapter::OFT(m)   => m.parameters(),
+        }
+    }
+
+    /// Live `Parameter` handles for this adapter, same stable order as
+    /// `parameters()`. The trainer hands these directly to the optimizer
+    /// so AdamW updates reach the adapter's internal storage.
+    pub fn parameters_handles(&self) -> Vec<Parameter> {
+        match self {
+            LycorisAdapter::LoCon(m) => m.parameters_handles(),
+            LycorisAdapter::LoHa(m)  => m.parameters_handles(),
+            LycorisAdapter::LoKr(m)  => m.parameters_handles(),
+            LycorisAdapter::Full(m)  => m.parameters_handles(),
+            LycorisAdapter::OFT(m)   => m.parameters_handles(),
         }
     }
 }

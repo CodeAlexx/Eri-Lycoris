@@ -394,9 +394,9 @@ fn build_locon(
     };
 
     Ok(LoConModule {
-        down,
-        up,
-        mid,
+        down: flame_core::parameter::Parameter::new(down),
+        up: flame_core::parameter::Parameter::new(up),
+        mid: mid.map(flame_core::parameter::Parameter::new),
         rank,
         alpha,
         device,
@@ -522,12 +522,12 @@ fn build_loha(
     };
 
     Ok(LoHaModule {
-        w1a,
-        w1b,
-        w2a,
-        w2b,
-        t1,
-        t2,
+        w1a: flame_core::parameter::Parameter::new(w1a),
+        w1b: flame_core::parameter::Parameter::new(w1b),
+        w2a: flame_core::parameter::Parameter::new(w2a),
+        w2b: flame_core::parameter::Parameter::new(w2b),
+        t1: t1.map(flame_core::parameter::Parameter::new),
+        t2: t2.map(flame_core::parameter::Parameter::new),
         rank,
         alpha,
         device,
@@ -616,13 +616,13 @@ fn build_lokr(
     let shape = ((0usize, 0usize), (0usize, 0usize));
 
     Ok(LoKrModule {
-        w1,
-        w1a,
-        w1b,
-        w2,
-        w2a,
-        w2b,
-        t2,
+        w1: w1.map(flame_core::parameter::Parameter::new),
+        w1a: w1a.map(flame_core::parameter::Parameter::new),
+        w1b: w1b.map(flame_core::parameter::Parameter::new),
+        w2: w2.map(flame_core::parameter::Parameter::new),
+        w2a: w2a.map(flame_core::parameter::Parameter::new),
+        w2b: w2b.map(flame_core::parameter::Parameter::new),
+        t2: t2.map(flame_core::parameter::Parameter::new),
         rank,
         alpha,
         device,
@@ -638,7 +638,10 @@ fn build_full(prefix: &str, mut entries: HashMap<String, Tensor>) -> anyhow::Res
     // P0-7: pick up `.diff_b` (bias delta) if present. Upstream Full saves
     // it whenever the original layer has a bias (modules/full.py:128-132).
     let diff_b = entries.remove(".diff_b");
-    Ok(FullAdapter { diff, diff_b })
+    Ok(FullAdapter {
+        diff: flame_core::parameter::Parameter::new(diff),
+        diff_b: diff_b.map(flame_core::parameter::Parameter::new),
+    })
 }
 
 // ---------------------------------------------------------------------------
