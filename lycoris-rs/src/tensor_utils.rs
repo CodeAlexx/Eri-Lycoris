@@ -1,13 +1,56 @@
 /// Tensor utility functions for LyCORIS
 ///
-/// Helper functions to work with Flame tensors using BF16 storage
+/// Helper functions to work with Flame tensors. Inference path (loader,
+/// `apply_to`) uses the BF16 helpers as-is. Training path uses the
+/// `*_param` variants which set `requires_grad=true` on the returned leaf
+/// so flame_core's autograd records gradients into them and a trainer can
+/// wrap them in `flame_core::parameter::Parameter` for the optimizer.
 
 use crate::{Error, Result};
 use cudarc::driver::CudaDevice;
 use flame_core::{DType, Shape, Tensor};
 use std::sync::Arc;
 
-/// Create a random tensor with BF16 dtype
+/// Storage dtype policy for trainable adapter leaves.
+///
+/// - `Bf16` (legacy / inference-flame compatible): all leaves stored in BF16,
+///   compute also BF16. Matches the load-and-merge path used by
+///   `inference-flame/src/lycoris.rs`.
+/// - `F32` (EDv2 default for training): leaves stored in F32 (what AdamW
+///   state expects), compute upcasts/downcasts as the algorithm forward
+///   requires. Matches `eridiffusion-core/src/lora.rs::LoRALinear`.
+///
+/// Per-tensor: storage stays in the configured dtype. Compute paths upcast/
+/// downcast as needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageDtype {
+    /// BF16 storage, BF16 compute. Default for inference and back-compat.
+    Bf16,
+    /// F32 storage, BF16 compute (cast on every forward). EDv2 training default.
+    F32,
+}
+
+impl StorageDtype {
+    /// Map storage policy to the concrete flame_core DType used for the leaf.
+    pub fn to_dtype(self) -> DType {
+        match self {
+            StorageDtype::Bf16 => DType::BF16,
+            StorageDtype::F32 => DType::F32,
+        }
+    }
+}
+
+impl Default for StorageDtype {
+    /// Default = BF16 to preserve existing inference-flame call sites.
+    fn default() -> Self {
+        StorageDtype::Bf16
+    }
+}
+
+/// Create a random tensor with BF16 dtype (inference / non-training).
+///
+/// Returned tensor has `requires_grad=false`. Use `randn_bf16_param` for
+/// trainable leaves.
 pub fn randn_bf16(
     shape: Shape,
     mean: f32,
@@ -22,9 +65,64 @@ pub fn randn_bf16(
     tensor_f32.to_dtype(DType::BF16).map_err(|e| Error::Flame(e))
 }
 
-/// Create zeros tensor with BF16 dtype
+/// Create zeros tensor with BF16 dtype (inference / non-training).
+///
+/// Returned tensor has `requires_grad=false`. Use `zeros_bf16_param` for
+/// trainable leaves.
 pub fn zeros_bf16(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
     Tensor::zeros_dtype(shape, DType::BF16, device).map_err(|e| Error::Flame(e))
+}
+
+/// Trainable random leaf in `storage` dtype with `requires_grad=true`.
+///
+/// Returned tensor is a leaf the optimizer can collect via the
+/// `LycorisModule::parameters()` accessor. Wrap in
+/// `flame_core::parameter::Parameter::new(t.clone())` at the trainer layer
+/// to gain in-place AdamW updates.
+pub fn randn_param(
+    shape: Shape,
+    mean: f32,
+    std: f32,
+    storage: StorageDtype,
+    device: Arc<CudaDevice>,
+) -> Result<Tensor> {
+    let tensor_f32 = Tensor::randn(shape, mean, std, device).map_err(Error::Flame)?;
+    let leaf = match storage {
+        StorageDtype::F32 => tensor_f32,
+        StorageDtype::Bf16 => tensor_f32.to_dtype(DType::BF16).map_err(Error::Flame)?,
+    };
+    Ok(leaf.requires_grad_(true))
+}
+
+/// Trainable zeros leaf in `storage` dtype with `requires_grad=true`.
+///
+/// Used for the canonical "up"-side LoRA leaf (Kohya init: zero so the
+/// initial adapter delta is zero).
+pub fn zeros_param(
+    shape: Shape,
+    storage: StorageDtype,
+    device: Arc<CudaDevice>,
+) -> Result<Tensor> {
+    let dtype = storage.to_dtype();
+    let leaf = Tensor::zeros_dtype(shape, dtype, device).map_err(Error::Flame)?;
+    Ok(leaf.requires_grad_(true))
+}
+
+/// Back-compat shim: BF16-storage variant of `randn_param`. Equivalent to
+/// `randn_param(..., StorageDtype::Bf16, ...)`.
+pub fn randn_bf16_param(
+    shape: Shape,
+    mean: f32,
+    std: f32,
+    device: Arc<CudaDevice>,
+) -> Result<Tensor> {
+    randn_param(shape, mean, std, StorageDtype::Bf16, device)
+}
+
+/// Back-compat shim: BF16-storage variant of `zeros_param`. Equivalent to
+/// `zeros_param(..., StorageDtype::Bf16, ...)`.
+pub fn zeros_bf16_param(shape: Shape, device: Arc<CudaDevice>) -> Result<Tensor> {
+    zeros_param(shape, StorageDtype::Bf16, device)
 }
 
 /// Create BF16 tensor with Kaiming uniform initialization
@@ -42,20 +140,35 @@ pub fn kaiming_uniform_bf16(
     a: f32,
     device: Arc<CudaDevice>,
 ) -> Result<Tensor> {
-    let dims = shape.dims();
-    let fan_in = if dims.len() >= 2 {
-        dims[1]
-    } else {
-        dims[0]
-    };
-
-    let gain = (2.0 / (1.0 + a * a)).sqrt();
-    let std = gain * (3.0 / fan_in as f32).sqrt();
-
+    let std = kaiming_std_for(&shape, a);
     // Note: PyTorch uses uniform distribution U(-bound, bound)
     // We approximate with normal distribution N(0, std) for simplicity
     // Exact uniform would require custom kernel or Flame API extension
     randn_bf16(shape, 0.0, std, device)
+}
+
+/// Trainable kaiming-uniform leaf with `requires_grad=true`, in `storage` dtype.
+///
+/// Same kaiming-as-normal approximation as `kaiming_uniform_bf16` (see
+/// the note there). Use for the "down"-side / `_a` LoRA leaves; pair with
+/// `zeros_param` for the "up"-side / `_b` leaves so the initial adapter
+/// delta is exactly zero.
+pub fn kaiming_uniform_param(
+    shape: Shape,
+    a: f32,
+    storage: StorageDtype,
+    device: Arc<CudaDevice>,
+) -> Result<Tensor> {
+    let std = kaiming_std_for(&shape, a);
+    randn_param(shape, 0.0, std, storage, device)
+}
+
+#[inline]
+fn kaiming_std_for(shape: &Shape, a: f32) -> f32 {
+    let dims = shape.dims();
+    let fan_in = if dims.len() >= 2 { dims[1] } else { dims[0] };
+    let gain = (2.0 / (1.0 + a * a)).sqrt();
+    gain * (3.0 / fan_in as f32).sqrt()
 }
 
 /// Create tensor from vec with BF16 dtype

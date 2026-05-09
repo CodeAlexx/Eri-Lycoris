@@ -8,8 +8,10 @@
 //!
 //! Upstream save format: `lycoris/modules/full.py:128-132` (`custom_state_dict`).
 
-use crate::{Error, Result};
-use flame_core::Tensor;
+use crate::{tensor_utils, Error, Result, StorageDtype};
+use cudarc::driver::CudaDevice;
+use flame_core::{Shape, Tensor};
+use std::sync::Arc;
 
 pub struct FullAdapter {
     /// Raw weight delta tensor, in whatever shape the base weight uses.
@@ -22,6 +24,32 @@ pub struct FullAdapter {
 }
 
 impl FullAdapter {
+    /// Construct a fresh trainable Full adapter with `requires_grad=true`
+    /// leaves and storage dtype controlled by `dtype`.
+    ///
+    /// `weight_shape` is the base layer's weight shape (e.g. `[out, in]` for
+    /// Linear, `[kh, kw, ic, oc]` for Flame conv2d). `bias_size` is `Some(n)`
+    /// when the base layer has a bias of length `n`, else `None`.
+    ///
+    /// All leaves are zero-initialized so initial ΔW=0 and ΔB=0.
+    pub fn new_for_training(
+        weight_shape: Shape,
+        bias_size: Option<usize>,
+        device: Arc<CudaDevice>,
+        dtype: StorageDtype,
+    ) -> Result<Self> {
+        let diff = tensor_utils::zeros_param(weight_shape, dtype, device.clone())?;
+        let diff_b = match bias_size {
+            None => None,
+            Some(n) => Some(tensor_utils::zeros_param(
+                Shape::from_dims(&[n]),
+                dtype,
+                device,
+            )?),
+        };
+        Ok(Self { diff, diff_b })
+    }
+
     /// Returns `strength * diff`. Caller adds this to the base weight.
     pub fn delta_weight(&self, strength: f32) -> Result<Tensor> {
         if strength == 1.0 {
@@ -38,5 +66,19 @@ impl FullAdapter {
             Some(b) if strength == 1.0 => Ok(Some(b.clone())),
             Some(b) => Ok(Some(b.mul_scalar(strength).map_err(Error::Flame)?)),
         }
+    }
+
+    /// Trainable leaves: `[diff, diff_b?]`. Mirrors the `LycorisModule::parameters`
+    /// contract for adapters that don't implement the full trait.
+    /// `FullAdapter` is intentionally trait-free because it has no
+    /// `forward(x)` (it's a pure weight delta), but the trainer needs the
+    /// same accessor for optimizer collection.
+    pub fn parameters(&self) -> Vec<&Tensor> {
+        let mut out: Vec<&Tensor> = Vec::with_capacity(2);
+        out.push(&self.diff);
+        if let Some(ref b) = self.diff_b {
+            out.push(b);
+        }
+        out
     }
 }

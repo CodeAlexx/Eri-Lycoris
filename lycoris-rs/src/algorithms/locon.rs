@@ -7,7 +7,7 @@
 /// - Linear: [IN, OUT]
 /// - Conv2d: [KH, KW, IC, OC]
 
-use crate::{tensor_utils, Error, LycorisModule, Result};
+use crate::{tensor_utils, Error, LycorisModule, Result, StorageDtype};
 use cudarc::driver::CudaDevice;
 use flame_core::{DType, Shape, Tensor};
 use std::sync::Arc;
@@ -206,6 +206,126 @@ impl LoConModule {
         })
     }
 
+    /// Trainable variant of `new_linear`: F32-or-BF16 storage, `requires_grad=true`
+    /// on `down` and `up` so the optimizer can collect them via the
+    /// `LycorisModule::parameters` accessor.
+    ///
+    /// Init follows canonical PyTorch LoRA: `down ~ N(0, 1)`, `up = 0`. The
+    /// adapter delta is exactly zero at init.
+    pub fn new_linear_for_training(
+        in_features: usize,
+        out_features: usize,
+        rank: usize,
+        alpha: Option<f32>,
+        device: Arc<CudaDevice>,
+        dtype: StorageDtype,
+    ) -> Result<Self> {
+        let alpha = alpha.unwrap_or(rank as f32);
+
+        let down = tensor_utils::randn_param(
+            Shape::from_dims(&[in_features, rank]),
+            0.0,
+            1.0,
+            dtype,
+            device.clone(),
+        )?;
+        let up = tensor_utils::zeros_param(
+            Shape::from_dims(&[rank, out_features]),
+            dtype,
+            device.clone(),
+        )?;
+
+        Ok(Self {
+            down,
+            up,
+            mid: None,
+            rank,
+            alpha,
+            device,
+            is_conv: false,
+        })
+    }
+
+    /// Trainable variant of `new_conv2d`. See `new_linear_for_training` for
+    /// dtype/grad semantics. `mid` is only created when `use_tucker` and the
+    /// kernel has a non-1×1 spatial dim; it's also kaiming-uniform-initialized
+    /// to preserve init magnitude (matching upstream).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_conv2d_for_training(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize),
+        rank: usize,
+        alpha: Option<f32>,
+        use_tucker: bool,
+        device: Arc<CudaDevice>,
+        dtype: StorageDtype,
+    ) -> Result<Self> {
+        let alpha = alpha.unwrap_or(rank as f32);
+        let (kh, kw) = kernel_size;
+
+        let (down, up, mid) = if kh == 1 && kw == 1 {
+            let down = tensor_utils::randn_param(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
+                0.0,
+                1.0,
+                dtype,
+                device.clone(),
+            )?;
+            let up = tensor_utils::zeros_param(
+                Shape::from_dims(&[1, 1, rank, out_channels]),
+                dtype,
+                device.clone(),
+            )?;
+            (down, up, None)
+        } else if use_tucker {
+            let down = tensor_utils::randn_param(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
+                0.0,
+                1.0,
+                dtype,
+                device.clone(),
+            )?;
+            let up = tensor_utils::zeros_param(
+                Shape::from_dims(&[1, 1, rank, out_channels]),
+                dtype,
+                device.clone(),
+            )?;
+            let mid = tensor_utils::randn_param(
+                Shape::from_dims(&[kh, kw, rank, rank]),
+                0.0,
+                1.0,
+                dtype,
+                device.clone(),
+            )?;
+            (down, up, Some(mid))
+        } else {
+            let down = tensor_utils::randn_param(
+                Shape::from_dims(&[kh, kw, in_channels, rank]),
+                0.0,
+                1.0,
+                dtype,
+                device.clone(),
+            )?;
+            let up = tensor_utils::zeros_param(
+                Shape::from_dims(&[kh, kw, rank, out_channels]),
+                dtype,
+                device.clone(),
+            )?;
+            (down, up, None)
+        };
+
+        Ok(Self {
+            down,
+            up,
+            mid,
+            rank,
+            alpha,
+            device,
+            is_conv: true,
+        })
+    }
+
     /// Get the scaling factor (alpha / rank), returns 0.0 if rank==0
     #[inline]
     pub fn scale(&self) -> f32 {
@@ -377,6 +497,17 @@ impl LycorisModule for LoConModule {
         // Note: Cannot merge without base weight reference
         // Use merge_into() instead
         Ok(())
+    }
+
+    fn parameters(&self) -> Vec<&Tensor> {
+        // Order: [down, up, mid?]. Trainer pairs optimizer state by index.
+        let mut out: Vec<&Tensor> = Vec::with_capacity(3);
+        out.push(&self.down);
+        out.push(&self.up);
+        if let Some(ref m) = self.mid {
+            out.push(m);
+        }
+        out
     }
 }
 

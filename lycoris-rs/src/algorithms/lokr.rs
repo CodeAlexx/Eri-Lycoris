@@ -3,11 +3,11 @@
 //! Conv   ΔK = kron(W1:[OL,IM], W2_full:[OK,IN,KH,KW]) * scale  → [KH,KW,IC,OC]
 //! Public layouts: Linear [IN,OUT], Conv kernel [KH,KW,IC,OC] (NHWC runtime)
 
-use crate::{Error, LycorisModule, Result};
+use crate::{tensor_utils, Error, LycorisModule, Result, StorageDtype};
 use crate::ops::kronecker::{make_kronecker, make_kronecker_conv_kernel};
 use crate::ops::tucker::rebuild_conv_tucker;
 use cudarc::driver::CudaDevice;
-use flame_core::{DType, Tensor};
+use flame_core::{DType, Shape, Tensor};
 use std::sync::Arc;
 
 #[inline]
@@ -16,6 +16,22 @@ fn assert_bf16_storage(name: &str, t: &Tensor) -> Result<()> {
         return Err(Error::InvalidOperation(format!("{name} must use BF16 storage")));
     }
     Ok(())
+}
+
+/// Storage-policy-aware variant of `assert_bf16_storage`.
+///
+/// Inference / loader path stores everything in BF16. Training path may
+/// store leaves in F32 (matching `eridiffusion-core/src/lora.rs::LoRALinear`).
+/// This accepts either; the math primitives below upcast/downcast as needed.
+#[inline]
+fn assert_storage_dtype(name: &str, t: &Tensor) -> Result<()> {
+    match t.dtype() {
+        DType::BF16 | DType::F32 => Ok(()),
+        d => Err(Error::InvalidOperation(format!(
+            "{name} must use BF16 or F32 storage, got {:?}",
+            d
+        ))),
+    }
 }
 
 #[inline]
@@ -61,9 +77,342 @@ pub struct LoKrModule {
     pub is_conv: bool,
 }
 
+/// Factor a dimension into `(m, n)` with `m <= n` and `m * n == dimension`,
+/// matching `lycoris.functional.general.factorization` (`general.py:14-56`).
+///
+/// `factor > 0`: if it divides `dimension`, split as `(min(factor, q), max(factor, q))`
+/// where `q = dimension / factor`. Otherwise fall through.
+/// `factor <= 0`: no cap — find the closest-to-square factor pair.
+///
+/// This is the math LyCORIS uses to derive the LoKr `(out_l, out_k)` and
+/// `(in_m, in_n)` Kronecker block sizes from a `linear_dim × factor` config.
+fn factorization(dimension: usize, factor: i32) -> (usize, usize) {
+    let factor_pos = factor.max(0) as usize;
+
+    if factor > 0 && (dimension % factor_pos) == 0 {
+        let mut m = factor_pos;
+        let mut n = dimension / factor_pos;
+        if m > n {
+            std::mem::swap(&mut m, &mut n);
+        }
+        return (m, n);
+    }
+    let cap = if factor < 0 { dimension } else { factor_pos };
+    let mut m: usize = 1;
+    let mut n: usize = dimension;
+    let mut length = m + n;
+    loop {
+        let mut new_m = m + 1;
+        while new_m <= n && dimension % new_m != 0 {
+            new_m += 1;
+        }
+        if new_m > n {
+            break;
+        }
+        let new_n = dimension / new_m;
+        if new_m + new_n > length || new_m > cap {
+            break;
+        }
+        m = new_m;
+        n = new_n;
+        length = m + n;
+        if m >= n {
+            break;
+        }
+    }
+    if m > n {
+        std::mem::swap(&mut m, &mut n);
+    }
+    (m, n)
+}
+
 impl LoKrModule {
     #[inline]
     pub fn scale(&self) -> f32 { scale_from(self.alpha, self.rank) }
+
+    /// Construct a fresh, trainable LoKr adapter for a `Linear(in,out)` layer.
+    ///
+    /// Mirrors `lycoris.modules.lokr.LoKrModule.__init__` (Python:
+    /// `lokr.py:138-244`) for the linear branch:
+    ///
+    /// - `factor` is the upstream Kronecker split factor; `(out_l, out_k) =
+    ///   factorization(out, factor)` and `(in_m, in_n) = factorization(in, factor)`.
+    ///   `factor = -1` means "as-square-as-possible".
+    /// - `decompose_both = true` and `rank < max(out_l, in_m)/2` → factorize W1 too,
+    ///   producing `w1_a:[out_l,r]` and `w1_b:[r,in_m]`. Otherwise `w1:[out_l,in_m]` (full).
+    /// - `rank < max(out_k, in_n)/2` → factorize W2: `w2_a:[out_k,r]`, `w2_b:[r,in_n]`.
+    ///   Otherwise `w2:[out_k,in_n]` (full); upstream prints a "force full" warning,
+    ///   we silently take the full path.
+    /// - `use_scalar`: when true, `w2`/`w2_b` are kaiming-initialized so the adapter
+    ///   starts non-zero and a learnable scalar gates it. When false (default),
+    ///   `w2` (full) or `w2_b` (factorized) is initialized to zero so initial ΔW=0.
+    ///   `use_scalar=true` is **not yet plumbed** in this struct (no `scalar` field);
+    ///   it's accepted here for API stability but currently treated as `false`.
+    /// - `dtype`: `StorageDtype::F32` for EDv2 training (AdamW state); `Bf16` for
+    ///   inference / merge-only.
+    ///
+    /// Init policy follows the upstream Python verbatim — every leaf is kaiming
+    /// uniform (a=√5) **except** the canonical zero leg (`w2` full, or `w2_b`
+    /// factorized when `use_scalar=false`). This deviates from a simplified
+    /// "zero w1_b too" pattern: zeroing `w1_b` would zero W1 at init and break
+    /// the Kronecker product's symmetry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_linear(
+        in_features: usize,
+        out_features: usize,
+        rank: usize,
+        alpha: f32,
+        factor: i32,
+        decompose_both: bool,
+        use_scalar: bool,
+        device: Arc<CudaDevice>,
+        dtype: StorageDtype,
+    ) -> Result<Self> {
+        if in_features == 0 || out_features == 0 {
+            return Err(Error::InvalidOperation(
+                "LoKr::new_linear: in_features and out_features must be > 0".into(),
+            ));
+        }
+        if rank == 0 {
+            return Err(Error::InvalidOperation(
+                "LoKr::new_linear: rank must be > 0 for fresh construction".into(),
+            ));
+        }
+
+        let (in_m, in_n) = factorization(in_features, factor);
+        let (out_l, out_k) = factorization(out_features, factor);
+
+        // shape = ((out_l, out_k), (in_m, in_n))
+        let dec_w1 = decompose_both && rank < (out_l.max(in_m)) / 2;
+        let factorize_w2 = rank < (out_k.max(in_n)) / 2;
+        let kaiming_a = (5.0_f32).sqrt();
+
+        let (w1, w1a, w1b) = if dec_w1 {
+            // w1_a:[out_l, r], w1_b:[r, in_m]; both kaiming
+            let w1a = tensor_utils::kaiming_uniform_param(
+                Shape::from_dims(&[out_l, rank]),
+                kaiming_a,
+                dtype,
+                device.clone(),
+            )?;
+            let w1b = tensor_utils::kaiming_uniform_param(
+                Shape::from_dims(&[rank, in_m]),
+                kaiming_a,
+                dtype,
+                device.clone(),
+            )?;
+            (None, Some(w1a), Some(w1b))
+        } else {
+            // w1:[out_l, in_m], kaiming
+            let w1 = tensor_utils::kaiming_uniform_param(
+                Shape::from_dims(&[out_l, in_m]),
+                kaiming_a,
+                dtype,
+                device.clone(),
+            )?;
+            (Some(w1), None, None)
+        };
+
+        let (w2, w2a, w2b) = if factorize_w2 {
+            // w2_a:[out_k, r] kaiming; w2_b:[r, in_n] zero (so initial ΔW=0).
+            // upstream uses kaiming on w2_b iff use_scalar=true; we don't
+            // implement use_scalar yet, so treat as false (zero w2_b).
+            let _ = use_scalar; // reserved for future scalar-gating wiring
+            let w2a = tensor_utils::kaiming_uniform_param(
+                Shape::from_dims(&[out_k, rank]),
+                kaiming_a,
+                dtype,
+                device.clone(),
+            )?;
+            let w2b = tensor_utils::zeros_param(
+                Shape::from_dims(&[rank, in_n]),
+                dtype,
+                device.clone(),
+            )?;
+            (None, Some(w2a), Some(w2b))
+        } else {
+            // w2:[out_k, in_n] full, zero-init (upstream behavior with
+            // use_scalar=false). Stored as 2D for the linear path.
+            let w2 = tensor_utils::zeros_param(
+                Shape::from_dims(&[out_k, in_n]),
+                dtype,
+                device.clone(),
+            )?;
+            (Some(w2), None, None)
+        };
+
+        Ok(Self {
+            w1,
+            w1a,
+            w1b,
+            w2,
+            w2a,
+            w2b,
+            t2: None,
+            rank,
+            alpha,
+            device,
+            shape: ((out_l, out_k), (in_m, in_n)),
+            is_conv: false,
+        })
+    }
+
+    /// Construct a fresh, trainable LoKr adapter for a `Conv2d(in,out,kh,kw)` layer.
+    ///
+    /// Mirrors `LoKrModule.__init__` (`lokr.py:89-137`) for the conv branch.
+    /// Layout convention: W2 (full) is stored upstream as `[out_k, in_n, kh, kw]`;
+    /// we keep that layout in `self.w2` so `resolve_w2_full_ok_in_kh_kw` can
+    /// pass it straight to `make_kronecker_conv_kernel`.
+    ///
+    /// Tucker path is selected by `use_tucker = true && (kh > 1 || kw > 1)` and
+    /// **only when W2 is factorized** (upstream condition: `lora_dim < max(...)/2`).
+    /// In that case `t2:[r, r, kh, kw]`, `w2_a:[r, out_k]`, `w2_b:[r, in_n]` —
+    /// rank lives on axis 0 for both `w2a/w2b` (this is the layout the loader's
+    /// Tucker resolve path expects, see `resolve_w2_full_ok_in_kh_kw`).
+    ///
+    /// **Limitation**: the non-Tucker spatial-conv factorized W2 path
+    /// (`w2_a:[out_k,r] @ w2_b:[r, in_n*kh*kw]`) used by upstream's "Conv2d not
+    /// tucker" branch (`lokr.py:131-136`) is not constructed by this entry point
+    /// — for kh*kw > 1 with factorized W2 the caller should pass `use_tucker=true`,
+    /// or use `factor` such that W2 is full. Returning `Err` for now; expand
+    /// when an EDv2 trainer needs the spatial-non-tucker variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_conv2d(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize),
+        rank: usize,
+        alpha: f32,
+        factor: i32,
+        decompose_both: bool,
+        use_tucker: bool,
+        use_scalar: bool,
+        device: Arc<CudaDevice>,
+        dtype: StorageDtype,
+    ) -> Result<Self> {
+        if in_channels == 0 || out_channels == 0 {
+            return Err(Error::InvalidOperation(
+                "LoKr::new_conv2d: in_channels and out_channels must be > 0".into(),
+            ));
+        }
+        if rank == 0 {
+            return Err(Error::InvalidOperation(
+                "LoKr::new_conv2d: rank must be > 0 for fresh construction".into(),
+            ));
+        }
+        let (kh, kw) = kernel_size;
+        if kh == 0 || kw == 0 {
+            return Err(Error::InvalidOperation(
+                "LoKr::new_conv2d: kernel size dims must be > 0".into(),
+            ));
+        }
+
+        let (in_m, in_n) = factorization(in_channels, factor);
+        let (out_l, out_k) = factorization(out_channels, factor);
+        let tucker_active = use_tucker && (kh > 1 || kw > 1);
+        let kaiming_a = (5.0_f32).sqrt();
+        let _ = use_scalar; // scalar gating not yet implemented; reserved.
+
+        // W1 — same logic as linear (W1 is always 2D regardless of conv shape).
+        let dec_w1 = decompose_both && rank < (out_l.max(in_m)) / 2;
+        let (w1, w1a, w1b) = if dec_w1 {
+            let w1a = tensor_utils::kaiming_uniform_param(
+                Shape::from_dims(&[out_l, rank]),
+                kaiming_a,
+                dtype,
+                device.clone(),
+            )?;
+            let w1b = tensor_utils::kaiming_uniform_param(
+                Shape::from_dims(&[rank, in_m]),
+                kaiming_a,
+                dtype,
+                device.clone(),
+            )?;
+            (None, Some(w1a), Some(w1b))
+        } else {
+            let w1 = tensor_utils::kaiming_uniform_param(
+                Shape::from_dims(&[out_l, in_m]),
+                kaiming_a,
+                dtype,
+                device.clone(),
+            )?;
+            (Some(w1), None, None)
+        };
+
+        // W2 selection.
+        let factorize_w2 = rank < (out_k.max(in_n)) / 2;
+
+        let (w2, w2a, w2b, t2) = if !factorize_w2 {
+            // Full W2 conv kernel: [out_k, in_n, kh, kw], zero-init.
+            let w2 = tensor_utils::zeros_param(
+                Shape::from_dims(&[out_k, in_n, kh, kw]),
+                dtype,
+                device.clone(),
+            )?;
+            (Some(w2), None, None, None)
+        } else if tucker_active {
+            // Tucker factorized: t2:[r,r,kh,kw], w2a:[r,out_k], w2b:[r,in_n].
+            // Upstream stores t2 as [r, r, kh, kw] AND saves w2a/w2b with rank
+            // on axis 0 (`lokr.py:122-128`). resolve_w2_full_ok_in_kh_kw expects
+            // t2 already permuted to [kh, kw, r, r] (loader does that). For
+            // freshly-constructed modules we keep upstream's layout for
+            // `lokr_t2.shape == (r, r, kh, kw)` and let the loader's permute
+            // mismatch be handled by `resolve_w2_full_ok_in_kh_kw` itself.
+            //
+            // NB: the loader path takes already-permuted t2 ([kh,kw,r,r]).
+            // Fresh construction emits the upstream raw layout because that's
+            // what save_to_state_dict is going to write back. The resolve
+            // path needs to handle both — currently it only handles the
+            // permuted layout. This is a known limitation; documented below.
+            let t2 = tensor_utils::kaiming_uniform_param(
+                Shape::from_dims(&[rank, rank, kh, kw]),
+                kaiming_a,
+                dtype,
+                device.clone(),
+            )?;
+            let w2a = tensor_utils::kaiming_uniform_param(
+                Shape::from_dims(&[rank, out_k]),
+                kaiming_a,
+                dtype,
+                device.clone(),
+            )?;
+            // Zero-init w2b so initial ΔW=0 (use_scalar=false branch).
+            let w2b = tensor_utils::zeros_param(
+                Shape::from_dims(&[rank, in_n]),
+                dtype,
+                device.clone(),
+            )?;
+            (None, Some(w2a), Some(w2b), Some(t2))
+        } else {
+            // Factorized non-Tucker spatial conv requires `w2b:[r,in_n*kh*kw]`
+            // and the corresponding kron expansion. Not implemented yet; the
+            // resolve path expects `w2b:[r, in_n, kh, kw]` for the spatial
+            // case (`lokr.rs:149-160`), and upstream's lokr.py:131-136 stores
+            // `w2_b:[r, in_n*kh*kw]`. The two layouts disagree — opening this
+            // construction path will require a loader update to match.
+            return Err(Error::InvalidOperation(format!(
+                "LoKr::new_conv2d: factorized non-Tucker spatial conv (kh*kw={}) \
+                 not implemented; pass use_tucker=true or use a factor that \
+                 keeps W2 full",
+                kh * kw
+            )));
+        };
+
+        Ok(Self {
+            w1,
+            w1a,
+            w1b,
+            w2,
+            w2a,
+            w2b,
+            t2,
+            rank,
+            alpha,
+            device,
+            shape: ((out_l, out_k), (in_m, in_n)),
+            is_conv: true,
+        })
+    }
 
     /// Resolve W1 as a dense matrix [OL,IM]
     fn resolve_w1(&self) -> Result<Tensor> {
@@ -215,6 +564,37 @@ impl LycorisModule for LoKrModule {
     fn merge_to(&mut self, _multiplier: f32) -> Result<()> {
         // Deprecated - use external merging logic
         Ok(())
+    }
+
+    fn parameters(&self) -> Vec<&Tensor> {
+        // Order: [w1?, w1a?, w1b?, w2?, w2a?, w2b?, t2?]. Skip None.
+        // Each LoKr instance has either `w1` (full) XOR (`w1a` & `w1b`), and
+        // similarly for W2 (full / factorized / Tucker). Order inside the
+        // Vec is fixed so the trainer's optimizer state pairs by index
+        // across save / resume.
+        let mut out: Vec<&Tensor> = Vec::with_capacity(7);
+        if let Some(ref w) = self.w1 {
+            out.push(w);
+        }
+        if let Some(ref w) = self.w1a {
+            out.push(w);
+        }
+        if let Some(ref w) = self.w1b {
+            out.push(w);
+        }
+        if let Some(ref w) = self.w2 {
+            out.push(w);
+        }
+        if let Some(ref w) = self.w2a {
+            out.push(w);
+        }
+        if let Some(ref w) = self.w2b {
+            out.push(w);
+        }
+        if let Some(ref t) = self.t2 {
+            out.push(t);
+        }
+        out
     }
 }
 

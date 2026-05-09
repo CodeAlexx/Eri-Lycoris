@@ -7,7 +7,7 @@
 /// - Linear: [IN, OUT]
 /// - Conv2d: [KH, KW, IC, OC]
 
-use crate::{tensor_utils, Error, LycorisModule, Result};
+use crate::{tensor_utils, Error, LycorisModule, Result, StorageDtype};
 use cudarc::driver::CudaDevice;
 use flame_core::{DType, Shape, Tensor};
 use std::sync::Arc;
@@ -273,6 +273,162 @@ impl LoHaModule {
         })
     }
 
+    /// Trainable variant of `new_linear` for LoHa with `requires_grad=true`
+    /// leaves and storage policy controlled by `dtype`.
+    ///
+    /// Init follows LyCORIS canon: `w1a/w2a ~ N(0,1)`, `w1b = 0`,
+    /// `w2b ~ N(0, 0.1)`. Note: unlike LoRA, **`w2b` is *not* zero** at init —
+    /// the initial Hadamard product is `(w1a@0) ⊙ (w2a@small) = 0` (still
+    /// identity at init because `w1b=0` zeros the first branch). The post-init
+    /// adapter delta is therefore zero, but the training-step gradient on
+    /// `w1b` flows through the non-zero `w2`-branch, kicking optimization off
+    /// the saddle.
+    pub fn new_linear_for_training(
+        in_features: usize,
+        out_features: usize,
+        rank: usize,
+        alpha: Option<f32>,
+        device: Arc<CudaDevice>,
+        dtype: StorageDtype,
+    ) -> Result<Self> {
+        let alpha = alpha.unwrap_or(rank as f32);
+
+        let w1a = tensor_utils::randn_param(
+            Shape::from_dims(&[in_features, rank]),
+            0.0,
+            1.0,
+            dtype,
+            device.clone(),
+        )?;
+        let w1b = tensor_utils::zeros_param(
+            Shape::from_dims(&[rank, out_features]),
+            dtype,
+            device.clone(),
+        )?;
+        let w2a = tensor_utils::randn_param(
+            Shape::from_dims(&[in_features, rank]),
+            0.0,
+            1.0,
+            dtype,
+            device.clone(),
+        )?;
+        let w2b = tensor_utils::randn_param(
+            Shape::from_dims(&[rank, out_features]),
+            0.0,
+            0.1,
+            dtype,
+            device.clone(),
+        )?;
+
+        Ok(Self {
+            w1a,
+            w1b,
+            w2a,
+            w2b,
+            t1: None,
+            t2: None,
+            rank,
+            alpha,
+            device,
+            is_conv: false,
+        })
+    }
+
+    /// Trainable variant of `new_conv2d` for LoHa. See `new_linear_for_training`
+    /// for grad / dtype semantics; same init pattern with `w2b ~ N(0, 0.1)` and
+    /// (when Tucker enabled) `t1, t2 ~ N(0, 0.1)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_conv2d_for_training(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize),
+        rank: usize,
+        alpha: Option<f32>,
+        use_tucker: bool,
+        device: Arc<CudaDevice>,
+        dtype: StorageDtype,
+    ) -> Result<Self> {
+        let alpha = alpha.unwrap_or(rank as f32);
+        let (kh, kw) = kernel_size;
+
+        let (w1a, w1b, w2a, w2b, t1, t2) = if kh == 1 && kw == 1 {
+            let w1a = tensor_utils::randn_param(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
+                0.0, 1.0, dtype, device.clone(),
+            )?;
+            let w1b = tensor_utils::zeros_param(
+                Shape::from_dims(&[1, 1, rank, out_channels]),
+                dtype, device.clone(),
+            )?;
+            let w2a = tensor_utils::randn_param(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
+                0.0, 1.0, dtype, device.clone(),
+            )?;
+            let w2b = tensor_utils::randn_param(
+                Shape::from_dims(&[1, 1, rank, out_channels]),
+                0.0, 0.1, dtype, device.clone(),
+            )?;
+            (w1a, w1b, w2a, w2b, None, None)
+        } else if use_tucker {
+            let w1a = tensor_utils::randn_param(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
+                0.0, 1.0, dtype, device.clone(),
+            )?;
+            let w1b = tensor_utils::zeros_param(
+                Shape::from_dims(&[1, 1, rank, out_channels]),
+                dtype, device.clone(),
+            )?;
+            let w2a = tensor_utils::randn_param(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
+                0.0, 1.0, dtype, device.clone(),
+            )?;
+            let w2b = tensor_utils::randn_param(
+                Shape::from_dims(&[1, 1, rank, out_channels]),
+                0.0, 0.1, dtype, device.clone(),
+            )?;
+            let t1 = tensor_utils::randn_param(
+                Shape::from_dims(&[kh, kw, rank, rank]),
+                0.0, 0.1, dtype, device.clone(),
+            )?;
+            let t2 = tensor_utils::randn_param(
+                Shape::from_dims(&[kh, kw, rank, rank]),
+                0.0, 0.1, dtype, device.clone(),
+            )?;
+            (w1a, w1b, w2a, w2b, Some(t1), Some(t2))
+        } else {
+            let w1a = tensor_utils::randn_param(
+                Shape::from_dims(&[kh, kw, in_channels, rank]),
+                0.0, 1.0, dtype, device.clone(),
+            )?;
+            let w1b = tensor_utils::zeros_param(
+                Shape::from_dims(&[kh, kw, rank, out_channels]),
+                dtype, device.clone(),
+            )?;
+            let w2a = tensor_utils::randn_param(
+                Shape::from_dims(&[kh, kw, in_channels, rank]),
+                0.0, 1.0, dtype, device.clone(),
+            )?;
+            let w2b = tensor_utils::randn_param(
+                Shape::from_dims(&[kh, kw, rank, out_channels]),
+                0.0, 0.1, dtype, device.clone(),
+            )?;
+            (w1a, w1b, w2a, w2b, None, None)
+        };
+
+        Ok(Self {
+            w1a,
+            w1b,
+            w2a,
+            w2b,
+            t1,
+            t2,
+            rank,
+            alpha,
+            device,
+            is_conv: true,
+        })
+    }
+
     /// Get the scaling factor (alpha / rank), returns 0.0 if rank==0
     #[inline]
     pub fn scale(&self) -> f32 {
@@ -502,6 +658,22 @@ impl LycorisModule for LoHaModule {
             .mul_scalar(multiplier)
             .map_err(Error::Flame)?;
         Ok(())
+    }
+
+    fn parameters(&self) -> Vec<&Tensor> {
+        // Order: [w1a, w1b, w2a, w2b, t1?, t2?]. See LycorisModule docs.
+        let mut out: Vec<&Tensor> = Vec::with_capacity(6);
+        out.push(&self.w1a);
+        out.push(&self.w1b);
+        out.push(&self.w2a);
+        out.push(&self.w2b);
+        if let Some(ref t) = self.t1 {
+            out.push(t);
+        }
+        if let Some(ref t) = self.t2 {
+            out.push(t);
+        }
+        out
     }
 }
 

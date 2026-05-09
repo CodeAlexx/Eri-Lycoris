@@ -9,6 +9,7 @@
 //! - Weight-merge `apply_to` API for inference-time fusion
 
 pub mod algorithms;
+pub mod dora;
 pub mod ops;
 pub mod error;
 pub mod dtype;
@@ -19,6 +20,7 @@ pub mod loader;
 pub use error::{Error, Result};
 pub use dtype::DType;
 pub use layout::{TensorLayout, LayoutConverter};
+pub use tensor_utils::StorageDtype;
 
 // Re-export core Flame types
 pub use flame_core::{Tensor, Shape, Device};
@@ -28,6 +30,7 @@ pub use algorithms::full::FullAdapter;
 pub use algorithms::locon::LoConModule as LoconAdapter;
 pub use algorithms::loha::LoHaModule as LohaAdapter;
 pub use algorithms::lokr::LoKrModule as LokrAdapter;
+pub use algorithms::oft::OFTModule as OftAdapter;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -44,6 +47,24 @@ pub trait LycorisModule {
 
     /// Merge LoRA weights into base weights
     fn merge_to(&mut self, multiplier: f32) -> Result<()>;
+
+    /// Trainable leaf tensors owned by this module, in a stable, defined
+    /// order. The trainer wraps each into `flame_core::parameter::Parameter`
+    /// (or registers them with its own optimizer) for the AdamW step.
+    ///
+    /// **Order contract** — kept stable so checkpoint resume can pair
+    /// optimizer state by index:
+    /// - LoCon: `[down, up]` (+ `mid` if Tucker)
+    /// - LoHa:  `[w1a, w1b, w2a, w2b]` (+ `t1, t2` if Tucker)
+    /// - LoKr:  one of the following, in this order whenever present:
+    ///   `[w1?, w1a?, w1b?, w2?, w2a?, w2b?, t2?]`
+    /// - Full:  `[diff]` (+ `diff_b` if present)
+    ///
+    /// Returned tensors should have `requires_grad=true` for any leaf
+    /// constructed via the `*_param` / `_for_training` helpers; legacy
+    /// loader-only adapters (BF16 storage, `requires_grad=false`) still
+    /// surface here so the trainer can detect the policy mismatch.
+    fn parameters(&self) -> Vec<&Tensor>;
 }
 
 /// Top-level adapter variant — one entry per Kohya/LyCORIS prefix in a
@@ -53,6 +74,11 @@ pub enum LycorisAdapter {
     LoHa(LohaAdapter),
     LoKr(LokrAdapter),
     Full(FullAdapter),
+    /// Diag-OFT (orthogonal fine-tuning, Cayley-Neumann). Note: OFT is a
+    /// **multiplicative** adapter (`W' = R^T·W`), so `delta_weight` errors
+    /// here — `apply_to` cannot merge OFT without base-weight access. Use
+    /// `OFTModule::apply_to_input` for forward-time application instead.
+    OFT(OftAdapter),
 }
 
 impl LycorisAdapter {
@@ -64,6 +90,20 @@ impl LycorisAdapter {
             LycorisAdapter::LoHa(m)  => m.get_diff_weight(),
             LycorisAdapter::LoKr(m)  => m.get_diff_weight(),
             LycorisAdapter::Full(m)  => m.delta_weight(1.0),
+            LycorisAdapter::OFT(m)   => m.get_diff_weight(),
+        }
+    }
+
+    /// Trainable leaves for this adapter, in the order documented on
+    /// `LycorisModule::parameters`. Used by trainers to register adapter
+    /// tensors with the optimizer.
+    pub fn parameters(&self) -> Vec<&Tensor> {
+        match self {
+            LycorisAdapter::LoCon(m) => m.parameters(),
+            LycorisAdapter::LoHa(m)  => m.parameters(),
+            LycorisAdapter::LoKr(m)  => m.parameters(),
+            LycorisAdapter::Full(m)  => m.parameters(),
+            LycorisAdapter::OFT(m)   => m.parameters(),
         }
     }
 }
