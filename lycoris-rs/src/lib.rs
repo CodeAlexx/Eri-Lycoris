@@ -10,6 +10,7 @@
 
 pub mod algorithms;
 pub mod dora;
+pub mod dropout;
 pub mod ops;
 pub mod error;
 pub mod dtype;
@@ -32,6 +33,7 @@ pub use algorithms::locon::LoConModule as LoconAdapter;
 pub use algorithms::loha::LoHaModule as LohaAdapter;
 pub use algorithms::lokr::LoKrModule as LokrAdapter;
 pub use algorithms::oft::OFTModule as OftAdapter;
+pub use algorithms::boft::BOFTModule as BoftAdapter;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -94,6 +96,11 @@ pub enum LycorisAdapter {
     /// here — `apply_to` cannot merge OFT without base-weight access. Use
     /// `OFTModule::apply_to_input` for forward-time application instead.
     OFT(OftAdapter),
+    /// BOFT (butterfly OFT): `m` consecutive block-diagonal rotations with
+    /// permuted block layouts between stages. Same multiplicative-on-input
+    /// semantics as OFT — `delta_weight` errors here, use
+    /// `BOFTModule::apply_to_input`.
+    BOFT(BoftAdapter),
 }
 
 impl LycorisAdapter {
@@ -106,6 +113,7 @@ impl LycorisAdapter {
             LycorisAdapter::LoKr(m)  => m.get_diff_weight(),
             LycorisAdapter::Full(m)  => m.delta_weight(1.0),
             LycorisAdapter::OFT(m)   => m.get_diff_weight(),
+            LycorisAdapter::BOFT(m)  => m.get_diff_weight(),
         }
     }
 
@@ -124,6 +132,7 @@ impl LycorisAdapter {
             LycorisAdapter::LoKr(m)  => m.parameters(),
             LycorisAdapter::Full(m)  => m.parameters(),
             LycorisAdapter::OFT(m)   => m.parameters(),
+            LycorisAdapter::BOFT(m)  => m.parameters(),
         }
     }
 
@@ -137,6 +146,7 @@ impl LycorisAdapter {
             LycorisAdapter::LoKr(m)  => m.parameters_handles(),
             LycorisAdapter::Full(m)  => m.parameters_handles(),
             LycorisAdapter::OFT(m)   => m.parameters_handles(),
+            LycorisAdapter::BOFT(m)  => m.parameters_handles(),
         }
     }
 }

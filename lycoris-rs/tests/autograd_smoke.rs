@@ -112,8 +112,37 @@ fn locon_linear_autograd_records_lora_b_grad() {
     println!("[LoCon-linear] PASS (down grad expected zero with up=zeros init)");
 }
 
+/// LoHa step-0 grad pattern with one zero-init leaf.
+///
+/// Setup mirrors upstream LyCORIS Python init (`use_scalar=False`): three
+/// non-zero leaves and one zero leaf in the second Hadamard branch (here,
+/// `w2a = 0`). Math at step 0:
+///   diff_w = (w1a @ w1b) ⊙ (w2a @ w2b) = nonzero ⊙ (0 @ w2b) = 0
+///   ∂L/∂w1 = ∂L/∂diff_w · w2 = ∂L/∂diff_w · 0 = 0
+///   ∂L/∂w2 = ∂L/∂diff_w · w1 ≠ 0  (w1 = w1a@w1b nonzero)
+/// Backward through the two MatMuls then gives:
+///   ∂L/∂w1a = 0 @ w1b^T = 0  (DEAD)
+///   ∂L/∂w1b = w1a^T @ 0 = 0  (DEAD)
+///   ∂L/∂w2a = ∂L/∂w2 @ w2b^T ≠ 0  (ALIVE)
+///   ∂L/∂w2b = w2a^T @ ∂L/∂w2 = 0 @ ∂L/∂w2 = 0  (DEAD)
+///
+/// Only the zero-init leaf itself (`w2a`) gets a non-zero gradient at
+/// step 0. This is identical to upstream PyTorch LyCORIS step-0 behavior
+/// and is **not an autograd bug** — it's the structural saddle point the
+/// algorithm starts from. After the first optimizer update drives `w2a`
+/// off zero, all four matrices receive non-zero gradients.
+///
+/// This test exists to:
+///   (a) gate that the autograd tape DOES route a gradient back to `w2a`
+///       through the MatMul → Mul → MatMul chain (the cast-then-record
+///       fix from `lycoris-rs ac5350d` is what makes this work for F32
+///       trainable storage paired with BF16 inputs);
+///   (b) document, in code, that the other three leaves are expected to
+///       be exactly zero at step 0 — so a future change that "fixes"
+///       this test by claiming all four should be alive is recognized
+///       as a regression of either the math or the test's intent.
 #[test]
-fn loha_linear_autograd_records_w2b_grad() {
+fn loha_linear_autograd_records_w2a_grad() {
     let Some(dev) = try_device() else { eprintln!("[loha_linear] no CUDA — skipped"); return; };
 
     const IN: usize = 64;
@@ -123,12 +152,11 @@ fn loha_linear_autograd_records_w2b_grad() {
 
     let mut m = LoHaModule::new_linear(IN, OUT, RANK, Some(ALPHA), dev.clone())
         .expect("LoHaModule::new_linear");
-    // Branch 1: fully nonzero so w1 = w1a @ w1b ≠ 0.
-    m.w1a = Parameter::new(leaf_randn_bf16(&[IN, RANK],  1.0, dev.clone()));
-    m.w1b = Parameter::new(leaf_randn_bf16(&[RANK, OUT], 0.1, dev.clone()));
-    // Branch 2: w2a random, w2b zeros — checking that grad flows to w2b.
-    m.w2a = Parameter::new(leaf_randn_bf16(&[IN, RANK],  1.0, dev.clone()));
-    m.w2b = Parameter::new(leaf_zeros_bf16(&[RANK, OUT], dev.clone()));
+    // Upstream init (`use_scalar=False`): only `w2a` is zero.
+    m.w1a = Parameter::new(leaf_randn_bf16(&[IN, RANK],  0.1, dev.clone()));
+    m.w1b = Parameter::new(leaf_randn_bf16(&[RANK, OUT], 1.0, dev.clone()));
+    m.w2a = Parameter::new(leaf_zeros_bf16(&[IN, RANK],       dev.clone()));
+    m.w2b = Parameter::new(leaf_randn_bf16(&[RANK, OUT], 1.0, dev.clone()));
 
     let x = leaf_randn_bf16(&[2, IN], 1.0, dev.clone());
 
@@ -136,15 +164,31 @@ fn loha_linear_autograd_records_w2b_grad() {
     let loss = out.to_dtype(DType::F32).expect("to F32").sum().expect("sum");
     let grads = flame_core::autograd::backward(&loss, false).expect("backward");
 
-    let g_w2b = grads.get(m.w2b.id()).expect("missing grad for w2b");
+    let g_w1a = grads.get(m.w1a.id()).expect("missing grad for w1a");
     let g_w1b = grads.get(m.w1b.id()).expect("missing grad for w1b");
-    let mw2b = max_abs_host(g_w2b);
+    let g_w2a = grads.get(m.w2a.id()).expect("missing grad for w2a");
+    let g_w2b = grads.get(m.w2b.id()).expect("missing grad for w2b");
+    let mw1a = max_abs_host(g_w1a);
     let mw1b = max_abs_host(g_w1b);
-    println!("[LoHa-linear] grad_w2b max_abs={:e}, grad_w1b max_abs={:e}", mw2b, mw1b);
-    assert!(mw2b.is_finite() && mw2b > PASS_THRESHOLD,
-        "LoHa-linear: w2b grad is zero / non-finite — autograd not recording");
-    assert!(mw1b.is_finite() && mw1b > PASS_THRESHOLD,
-        "LoHa-linear: w1b grad is zero / non-finite — autograd not recording");
+    let mw2a = max_abs_host(g_w2a);
+    let mw2b = max_abs_host(g_w2b);
+    println!(
+        "[LoHa-linear] grad max_abs: w1a={:e} w1b={:e} w2a={:e} w2b={:e}",
+        mw1a, mw1b, mw2a, mw2b,
+    );
+    // Only `w2a` (the zero-init leaf) is alive — see header comment.
+    assert!(mw2a.is_finite() && mw2a > PASS_THRESHOLD,
+        "LoHa-linear: w2a grad is zero / non-finite — autograd not recording \
+         the (w2a @ w2b) MatMul branch back through the Hadamard product");
+    // Other three are mathematically zero at step 0; assert exactly that
+    // so a regression that introduces spurious non-zero grads (e.g. an
+    // accidentally non-recording op leaking a constant) gets caught.
+    assert!(mw1a == 0.0,
+        "LoHa-linear: w1a grad must be exactly zero at step 0 (w1 chain killed by w2=0); got {:e}", mw1a);
+    assert!(mw1b == 0.0,
+        "LoHa-linear: w1b grad must be exactly zero at step 0 (w1 chain killed by w2=0); got {:e}", mw1b);
+    assert!(mw2b == 0.0,
+        "LoHa-linear: w2b grad must be exactly zero at step 0 (w2a=0 multiplies upstream); got {:e}", mw2b);
     println!("[LoHa-linear] PASS");
 }
 
@@ -152,8 +196,12 @@ fn loha_linear_autograd_records_w2b_grad() {
 fn lokr_linear_autograd_records_w2b_grad() {
     let Some(dev) = try_device() else { eprintln!("[lokr_linear] no CUDA — skipped"); return; };
 
-    // Linear shape (IN, OUT) = (OL*OK, IM*IN) = (8, 16).
-    // ΔW = kron(W1:[OL,IM], W2:[OK,IN]) → [OL*OK, IM*IN]
+    // Linear shape (IN, OUT) = (IM*INN, OL*OK) = (16, 8).
+    // The mathematical ΔW for LoKr (PyTorch convention) is kron(W1, W2) with
+    // shape [OL*OK, IM*INN] = [OUT, IN]. The Rust forward, however, applies
+    // the factored multiply as `y = x @ ΔW^T` (equivalently F.linear), so the
+    // user-visible mapping is: input has IN=IM*INN features, output has
+    // OUT=OL*OK features. (See `forward_linear_factored` for the math.)
     const OL: usize = 4;
     const IM: usize = 4;
     const OK: usize = 2;
@@ -161,15 +209,13 @@ fn lokr_linear_autograd_records_w2b_grad() {
     const RANK: usize = 2;
     const ALPHA: f32 = 2.0;
 
-    let in_total  = IM * INN;       // 16
-    let out_total = OL * OK;        //  8
-    // NOTE: LoKr ΔW shape after make_kronecker is [OL*OK, IM*IN] = [out_total, in_total],
-    // and forward is `x.matmul(ΔW)`. So x must have last dim = OL*OK = 8.
+    let in_total  = IM * INN;       // 16  (input features)
+    let out_total = OL * OK;        //  8  (output features)
 
     // Factorized W1: w1a [OL, R], w1b [R, IM]  → W1 [OL, IM]
     let w1a = leaf_randn_bf16(&[OL, RANK], 1.0, dev.clone());
     let w1b = leaf_randn_bf16(&[RANK, IM], 0.5, dev.clone());
-    // Factorized W2: w2a [OK, R], w2b [R, IN]  → W2 [OK, IN]
+    // Factorized W2: w2a [OK, R], w2b [R, INN] → W2 [OK, INN]
     let w2a = leaf_randn_bf16(&[OK, RANK], 1.0, dev.clone());
     let w2b = leaf_zeros_bf16(&[RANK, INN], dev.clone());
 
@@ -188,8 +234,9 @@ fn lokr_linear_autograd_records_w2b_grad() {
         is_conv: false,
     };
 
-    // x: [batch, OL*OK] so x.matmul(ΔW[OL*OK, IM*IN]) = [batch, IM*IN].
-    let x = leaf_randn_bf16(&[2, out_total], 1.0, dev.clone());
+    // x: [batch, IM*INN] → forward yields [batch, OL*OK].
+    let x = leaf_randn_bf16(&[2, in_total], 1.0, dev.clone());
+    let _ = out_total; // silence unused if assertions below don't reference
 
     let out = m.forward(&x).expect("LoKr forward");
     let loss = out.to_dtype(DType::F32).expect("to F32").sum().expect("sum");

@@ -1,18 +1,35 @@
 //! Diag-OFT (Orthogonal Fine-Tuning) — block-diagonal Cayley-Neumann rotation.
 //!
-//! Mirrors OneTrainer's `OFTRotationModule` (modules/module/oft_utils.py:37) which
-//! is the canonical "OFT v2" path. We store **full blocks** rather than the
-//! upper-triangular vector form OneTrainer uses, because flame-core has neither
-//! `triu_indices` nor a scatter primitive — full-block storage trades a small
-//! amount of memory (`b²` floats per block instead of `b·(b−1)/2`) for autograd
-//! safety: skew construction reduces to `Q − Q.transpose_batch()`.
+//! Mirrors lycoris-upstream's `DiagOFTModule` (lycoris/modules/diag_oft.py) and
+//! OneTrainer's `OFTRotationModule` (modules/module/oft_utils.py:37). We store
+//! **full blocks** rather than the upper-triangular vector form OneTrainer uses,
+//! because flame-core has neither `triu_indices` nor a scatter primitive —
+//! full-block storage trades a small amount of memory (`b²` floats per block
+//! instead of `b·(b−1)/2`) for autograd safety: skew construction reduces to
+//! `Q − Q.transpose_batch()`.
 //!
 //! # Algorithm
 //!
 //! For each Linear layer with weight `W [in, out]`:
-//! - Split the input dim into `num_blocks` chunks of size `block_size`
-//!   (`in = num_blocks · block_size`). Each chunk is rotated independently by a
-//!   `[b, b]` orthogonal matrix.
+//! - Factorize the **input** dim into `num_blocks · block_size`. Each block is
+//!   a `[b, b]` orthogonal matrix that rotates its slice of the input feature
+//!   axis. This matches OneTrainer's `OFTRotationModule` (oft_utils.py:153,
+//!   `rank = self.in_features // self.block_size`). num_blocks is derived
+//!   from `in_features / block_size`.
+//! - The trainer flow is `output = base_linear(R · x)`: the adapter rotates
+//!   the input via [`AdapterModule::apply_input`], the base linear consumes
+//!   the rotated input. Because OFT operates on input space (not as an
+//!   additive output delta), the wrapper checks
+//!   [`AdapterModule::is_input_rotation`] and calls `apply_input` instead of
+//!   `forward_delta` for OFT adapters. **Works for any layer shape — square,
+//!   non-square FFN gates, projection-out layers, etc.**
+//! - Save-format note: this differs from lycoris-upstream (which factorizes
+//!   `out_features`) and stores `oft_blocks` interpreted on the output side.
+//!   We share the same shape `[block_num, block_size, block_size]` but the
+//!   `block_num` dimension here means input-side blocks. Loading a
+//!   SimpleTuner-trained OFT file into our trainer (or vice versa) without
+//!   transposition will silently produce wrong rotations. Parity loader is
+//!   a Tier 2 follow-up.
 //! - Per block, the trainable parameter is a full `[b, b]` matrix `Q`. Skew form
 //!   `Q_skew = Q − Q^T` (antisymmetric).
 //! - The rotation `R = (I − Q_skew)(I + Q_skew)^{-1}` (Cayley) is approximated
@@ -71,15 +88,17 @@ pub struct OFTModule {
     /// Block edge length (the `b` in `[b, b]`).
     pub block_size: usize,
 
-    /// Number of independent blocks (`in_features / block_size`).
+    /// Number of independent blocks (`out_features / block_size`).
     pub num_blocks: usize,
 
-    /// Linear layer's input feature count. Must equal `num_blocks · block_size`.
+    /// Linear layer's input feature count. **Drives the block factorization**
+    /// (`num_blocks * block_size == in_features`) — the rotation acts on the
+    /// input feature axis (OneTrainer style). Works for any out_features.
     pub in_features: usize,
 
-    /// Linear layer's output feature count. Stored for shape checks; the
-    /// rotation acts on the input dim, so `out_features` doesn't enter the
-    /// math directly.
+    /// Linear layer's output feature count. Recorded for shape-checking
+    /// downstream callers and save/load metadata; not used by the rotation
+    /// itself.
     pub out_features: usize,
 
     /// OFT scaling multiplier. Typically `1.0`. The rotation is exactly
@@ -112,19 +131,19 @@ fn param_tensor(p: &Parameter) -> Result<Tensor> {
 }
 
 #[inline]
-fn check_divisibility(in_features: usize, block_size: usize) -> Result<usize> {
+fn check_divisibility(out_features: usize, block_size: usize) -> Result<usize> {
     if block_size == 0 {
         return Err(Error::InvalidOperation(
             "OFT block_size must be > 0".into(),
         ));
     }
-    if in_features % block_size != 0 {
+    if out_features % block_size != 0 {
         return Err(Error::InvalidOperation(format!(
-            "OFT requires in_features ({}) divisible by block_size ({})",
-            in_features, block_size
+            "OFT requires out_features ({}) divisible by block_size ({})",
+            out_features, block_size
         )));
     }
-    Ok(in_features / block_size)
+    Ok(out_features / block_size)
 }
 
 /// Build a `[num_blocks, b, b]` identity tensor on device. Used both for
@@ -182,6 +201,10 @@ impl OFTModule {
         storage_dtype: StorageDtype,
         device: Arc<CudaDevice>,
     ) -> Result<Self> {
+        // OFT (OneTrainer style) factorizes the **input** feature dim. The
+        // rotation acts on `x`, then the base linear consumes the rotated
+        // input via the adapter wrapper's `apply_input` path. Works for
+        // arbitrary `out_features`.
         let num_blocks = check_divisibility(in_features, block_size)?;
 
         // F32 storage for `blocks` per the precision rationale in the module
@@ -281,7 +304,10 @@ impl OFTModule {
 
     /// Apply the OFT rotation to an input tensor. Shape `[*..., in_features]`.
     ///
-    /// Math: `out[*..., r, :] = x[*..., r, :] @ R[r, :, :]`.
+    /// Math: `out[*..., r, :] = x[*..., r, :] @ R[r, :, :]` where the feature
+    /// axis is split into `num_blocks` chunks of `block_size` over the
+    /// `in_features` dim.  The base linear runs on the rotated output —
+    /// callers route via `AdapterModule::apply_input`.
     ///
     /// At init (`blocks = 0`), `R = I` and the result is bit-identical to `x`.
     pub fn apply_to_input(&self, x: &Tensor) -> Result<Tensor> {
@@ -313,7 +339,7 @@ impl OFTModule {
         let x_compute = x.clone();
 
         // Flatten leading dims: x [*..., in] → [B, num_blocks, b]
-        // where B = product(*...) = numel / in.
+        // where B = product(*...) = numel / in_features.
         let numel: usize = in_dims.iter().product();
         let batch = numel / self.in_features;
         let x_3d = x_compute

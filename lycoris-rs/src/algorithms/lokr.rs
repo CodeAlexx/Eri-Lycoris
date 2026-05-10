@@ -445,6 +445,167 @@ impl LoKrModule {
         wa_t.matmul(&wb_t).map_err(Error::Flame) // [OL,IM]
     }
 
+    /// Storage-policy-aware variant of `resolve_w1` for the trainable forward
+    /// path. Reads raw params (F32 or BF16 storage), casts each leaf to
+    /// `target_dtype` *in record mode* via `to_dtype()` (mirrors the locon
+    /// `ac5350d` pattern), then materializes W1:[OL,IM] in `target_dtype`
+    /// via a small matmul that itself records autograd.
+    ///
+    /// Crucially, this does NOT call `make_kronecker`. Materializing the
+    /// full `[OL*OK, IM*IN]` Kronecker product in the residual path would
+    /// (a) blow memory and (b) emit the PyTorch `[OUT,IN]` layout, which
+    /// the Rust convention `x[..,IN] @ W[IN,OUT]` doesn't match.
+    fn resolve_w1_for_train(&self, target_dtype: DType) -> Result<Tensor> {
+        let cast = |t: Tensor| -> Result<Tensor> {
+            if t.dtype() != target_dtype {
+                t.to_dtype(target_dtype).map_err(Error::Flame)
+            } else {
+                Ok(t)
+            }
+        };
+        if let Some(ref w) = self.w1 {
+            let wt = param_tensor(w)?;
+            assert_storage_dtype("w1", &wt)?;
+            return cast(wt);
+        }
+        let wa = self.w1a.as_ref().ok_or_else(|| Error::InvalidOperation("w1a missing".into()))?;
+        let wb = self.w1b.as_ref().ok_or_else(|| Error::InvalidOperation("w1b missing".into()))?;
+        let wa_t = param_tensor(wa)?;
+        let wb_t = param_tensor(wb)?;
+        assert_storage_dtype("w1a", &wa_t)?;
+        assert_storage_dtype("w1b", &wb_t)?;
+        let wa_t = cast(wa_t)?;
+        let wb_t = cast(wb_t)?;
+        wa_t.matmul(&wb_t).map_err(Error::Flame) // [OL,IM] in target_dtype
+    }
+
+    /// Storage-policy-aware resolve for W2 in the **linear** branch, mirror
+    /// of `resolve_w1_for_train`. Returns W2:[OK, IN_inner] in `target_dtype`,
+    /// with all casts recorded for autograd.
+    ///
+    /// Linear-only: this is not used by the conv forward path. Tucker is
+    /// not applicable here (linear has no spatial extent).
+    fn resolve_w2_linear_for_train(&self, target_dtype: DType) -> Result<Tensor> {
+        let cast = |t: Tensor| -> Result<Tensor> {
+            if t.dtype() != target_dtype {
+                t.to_dtype(target_dtype).map_err(Error::Flame)
+            } else {
+                Ok(t)
+            }
+        };
+        if let Some(ref w2_full) = self.w2 {
+            let w2_t = param_tensor(w2_full)?;
+            assert_storage_dtype("w2", &w2_t)?;
+            let d = w2_t.dims().to_vec();
+            let w2_lin = if d.len() == 2 {
+                w2_t
+            } else if d.len() == 4 && d[2] == 1 && d[3] == 1 {
+                // [OK, IN, 1, 1] → [OK, IN] (linear consumed via 1×1 conv layout)
+                w2_t.reshape(&[d[0], d[1]]).map_err(Error::Flame)?
+            } else {
+                return Err(Error::InvalidOperation(
+                    "linear LoKr requires 2D w2 (or KH=KW=1)".into(),
+                ));
+            };
+            return cast(w2_lin);
+        }
+        let a = self
+            .w2a
+            .as_ref()
+            .ok_or_else(|| Error::InvalidOperation("w2a missing".into()))?;
+        let b = self
+            .w2b
+            .as_ref()
+            .ok_or_else(|| Error::InvalidOperation("w2b missing".into()))?;
+        let a_t = param_tensor(a)?;
+        let b_t = param_tensor(b)?;
+        assert_storage_dtype("w2a", &a_t)?;
+        assert_storage_dtype("w2b", &b_t)?;
+        let a_t = cast(a_t)?;
+        let b_t = cast(b_t)?;
+        // [OK, R] @ [R, IN_inner] → [OK, IN_inner], in target_dtype
+        a_t.matmul(&b_t).map_err(Error::Flame)
+    }
+
+    /// Factored linear forward — applies ΔW = scale * kron(W1, W2) to `x`
+    /// **without ever materializing the [OUT, IN] Kronecker product**.
+    ///
+    /// Uses the identity `kron(A, B) @ vec(X) = vec(B @ X @ A^T)` adapted
+    /// to row-major batched form (mirror of upstream
+    /// `lycoris.functional.lokr.bypass_forward_diff`, linear branch):
+    ///
+    /// ```text
+    ///   x          : [..., IN]                    where IN = IM * IN_inner
+    ///   x_split    : [N, IM, IN_inner]            (N = product of leading dims)
+    ///   h2 = x_split @ W2^T                       : [N, IM, OK]
+    ///   h2_t = swap_last_two(h2)                  : [N, OK, IM]
+    ///   h1 = h2_t @ W1^T                          : [N, OK, OL]
+    ///   h1_t = swap_last_two(h1)                  : [N, OL, OK]
+    ///   out = reshape(h1_t, [.., OL*OK]) * scale  : [..., OUT]
+    /// ```
+    ///
+    /// W1:[OL,IM] and W2:[OK, IN_inner] are both resolved from F32-or-BF16
+    /// params, cast to `x.dtype()` in record mode, and combined via small
+    /// matmuls — total temp footprint ~`max(N*IM*OK, N*OK*OL)`, never
+    /// `OUT*IN`.
+    fn forward_linear_factored(&self, x: &Tensor) -> Result<Tensor> {
+        let target_dtype = x.dtype();
+        let ((ol, ok), (im, in_inner)) = self.shape;
+        let in_features = im * in_inner;
+        let out_features = ol * ok;
+
+        let x_dims = x.dims().to_vec();
+        let last = *x_dims.last().ok_or_else(|| {
+            Error::InvalidOperation("LoKr linear forward: input has rank 0".into())
+        })?;
+        if last != in_features {
+            return Err(Error::InvalidOperation(format!(
+                "LoKr linear forward: expected last dim {}, got {}",
+                in_features, last
+            )));
+        }
+        let leading: usize = x_dims[..x_dims.len() - 1].iter().product();
+
+        let w1 = self.resolve_w1_for_train(target_dtype)?; // [OL, IM]
+        let w2 = self.resolve_w2_linear_for_train(target_dtype)?; // [OK, IN_inner]
+
+        // Flatten leading dims so 3D matmul fast-paths apply: [N, IN] → [N, IM, IN_inner].
+        let x_flat = x.reshape(&[leading, in_features]).map_err(Error::Flame)?;
+        let x_split = x_flat
+            .reshape(&[leading, im, in_inner])
+            .map_err(Error::Flame)?;
+
+        // Step 1: x_split @ W2^T → [N, IM, OK]
+        let w2_t = w2.transpose().map_err(Error::Flame)?; // [IN_inner, OK]
+        let h2 = x_split.matmul(&w2_t).map_err(Error::Flame)?; // [N, IM, OK]
+
+        // Step 2: swap last two → [N, OK, IM]
+        let h2_t = h2.transpose_batch().map_err(Error::Flame)?;
+
+        // Step 3: h2_t @ W1^T → [N, OK, OL]
+        let w1_t = w1.transpose().map_err(Error::Flame)?; // [IM, OL]
+        let h1 = h2_t.matmul(&w1_t).map_err(Error::Flame)?; // [N, OK, OL]
+
+        // Step 4: swap last two → [N, OL, OK]; reshape to [N, OL*OK]
+        let h1_t = h1.transpose_batch().map_err(Error::Flame)?;
+        let out_flat = h1_t
+            .reshape(&[leading, out_features])
+            .map_err(Error::Flame)?;
+
+        // Restore original leading shape.
+        let mut out_dims = x_dims;
+        *out_dims.last_mut().expect("out_dims nonempty") = out_features;
+        let out = out_flat.reshape(&out_dims).map_err(Error::Flame)?;
+
+        // Apply alpha/rank scale.
+        let s = self.scale();
+        if s == 1.0 {
+            Ok(out)
+        } else {
+            out.mul_scalar(s).map_err(Error::Flame)
+        }
+    }
+
     /// Resolve W2 to a full conv kernel **in OK/IN/KH/KW order**.
     /// Returns [OK,IN,KH,KW].
     fn resolve_w2_full_ok_in_kh_kw(&self) -> Result<Tensor> {
@@ -535,21 +696,148 @@ impl LoKrModule {
             _ => Err(Error::InvalidOperation("unsupported w2b rank; expected [R,IN] or [R,IN,KH,KW]".into())),
         }
     }
+
+    /// SimpleTuner-style perturbed-normal LoKr init.
+    ///
+    /// Mirrors `simpletuner/helpers/training/peft_init.py:21`
+    /// (`init_lokr_network_with_perturbed_normal`):
+    ///
+    /// ```python
+    /// lora.lokr_w1.fill_(1.0)
+    /// approximate_normal_tensor(lora.org_weight, lora.lokr_w2, scale=scale)
+    /// ```
+    ///
+    /// where `approximate_normal_tensor(inp, target, scale)` writes a randn
+    /// tensor into `target`, rescaled to match `inp`'s norm and std, shifted
+    /// to `inp`'s mean, then multiplied by `scale`.  Effect: at init, the
+    /// adapter delta `kron(W1, W2) ≈ scale · N(μ_W, σ_W)`, a tiny perturbation
+    /// of the base weight in its own statistical envelope — tends to shorten
+    /// fine-tune ramp-up vs the canonical zero-W2 init.
+    ///
+    /// Only valid on the **full-form** LoKr variant (`w1` and `w2` both
+    /// present, neither factorized).  Returns `Err` when the constructor
+    /// chose factored W1 (`decompose_both=true && rank<max(out_l,in_m)/2`)
+    /// or factored W2 (`rank<max(out_k,in_n)/2`); rebuild with larger rank
+    /// or `decompose_both=false` to enable.
+    ///
+    /// Stat computation runs host-side (one-shot at init), so no GPU
+    /// reduction primitives needed.  The randn draw uses
+    /// `Tensor::randn(0, 1, ...)` so the result is reproducible under
+    /// `flame_core::rng::set_seed`.
+    pub fn init_perturbed_normal(&self, base_weight: &Tensor, scale: f32) -> Result<()> {
+        let w1 = self.w1.as_ref().ok_or_else(|| {
+            Error::InvalidOperation(
+                "LoKrModule::init_perturbed_normal requires full W1; \
+                 reconstruct with `decompose_both=false` or larger rank.".into(),
+            )
+        })?;
+        let w2 = self.w2.as_ref().ok_or_else(|| {
+            Error::InvalidOperation(
+                "LoKrModule::init_perturbed_normal requires full W2; \
+                 reconstruct with rank ≥ max(out_k, in_n) / 2.".into(),
+            )
+        })?;
+
+        // Step 1: lokr_w1.fill_(1.0)
+        let w1_t = w1.tensor().map_err(Error::Flame)?;
+        let w1_dtype = w1_t.dtype();
+        let w1_shape = Shape::from_dims(w1_t.dims());
+        let ones = Tensor::ones_dtype(w1_shape, w1_dtype, self.device.clone())
+            .map_err(Error::Flame)?
+            .requires_grad_(true);
+        w1.set_data(ones).map_err(Error::Flame)?;
+
+        // Step 2: approximate_normal_tensor(base_weight, w2, scale).
+        // Compute base stats in F32 on host.
+        let bw_f32 = base_weight.to_dtype(DType::F32).map_err(Error::Flame)?;
+        let bw_vec = bw_f32.to_vec().map_err(Error::Flame)?;
+        if bw_vec.is_empty() {
+            return Err(Error::InvalidOperation(
+                "init_perturbed_normal: base_weight is empty".into(),
+            ));
+        }
+        let n = bw_vec.len() as f32;
+        let bw_mean = bw_vec.iter().sum::<f32>() / n;
+        let bw_var = bw_vec.iter().map(|v| (v - bw_mean).powi(2)).sum::<f32>() / n;
+        let bw_std = bw_var.sqrt();
+        let bw_norm = bw_vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+
+        // Draw randn matching W2 shape.
+        let w2_t = w2.tensor().map_err(Error::Flame)?;
+        let w2_dtype = w2_t.dtype();
+        let w2_dims = w2_t.dims().to_vec();
+        let randn = Tensor::randn(
+            Shape::from_dims(&w2_dims),
+            0.0,
+            1.0,
+            self.device.clone(),
+        )
+        .map_err(Error::Flame)?;
+        let randn_f32 = randn.to_dtype(DType::F32).map_err(Error::Flame)?;
+        let randn_vec = randn_f32.to_vec().map_err(Error::Flame)?;
+
+        // Mirror `approximate_normal_tensor` step-by-step:
+        // 1) scale to bw norm
+        let t_norm = randn_vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let s_norm = bw_norm / (t_norm + 1e-12);
+        let v1: Vec<f32> = randn_vec.iter().map(|x| x * s_norm).collect();
+        // 2) rescale to bw std
+        let v1_n = v1.len() as f32;
+        let v1_mean = v1.iter().sum::<f32>() / v1_n;
+        let v1_var = v1.iter().map(|x| (x - v1_mean).powi(2)).sum::<f32>() / v1_n;
+        let v1_std = v1_var.sqrt();
+        let s_std = bw_std / (v1_std + 1e-12);
+        let v2: Vec<f32> = v1.iter().map(|x| x * s_std).collect();
+        // 3) shift to bw mean
+        let v2_mean = v2.iter().sum::<f32>() / v1_n;
+        let v3: Vec<f32> = v2.iter().map(|x| x - v2_mean + bw_mean).collect();
+        // 4) multiply by scale
+        let v4: Vec<f32> = v3.iter().map(|x| x * scale).collect();
+
+        let new_w2_f32 = Tensor::from_vec_dtype(
+            v4,
+            Shape::from_dims(&w2_dims),
+            self.device.clone(),
+            DType::F32,
+        )
+        .map_err(Error::Flame)?;
+        let new_w2 = if w2_dtype != DType::F32 {
+            new_w2_f32.to_dtype(w2_dtype).map_err(Error::Flame)?
+        } else {
+            new_w2_f32
+        }
+        .requires_grad_(true);
+        w2.set_data(new_w2).map_err(Error::Flame)?;
+        Ok(())
+    }
 }
 
 impl LycorisModule for LoKrModule {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // See `LoConModule::forward` for the dtype-coercion rationale —
-        // dw is composed from F32-storage params; cast to `x.dtype()` *with
-        // autograd recording* before mixing into the residual graph.
-        let target_dtype = x.dtype();
+        // F32-storage params must be cast to `x.dtype()` *with autograd
+        // recording* (via `to_dtype()`, not the matmul auto-cast which
+        // uses `to_dtype_no_grad`) before mixing into the residual graph.
         if !self.is_conv {
-            // Linear: x[..., IN] @ ΔW[IN,OUT]
-            let dw = self.get_diff_weight()?;
-            let dw = if dw.dtype() != target_dtype { dw.to_dtype(target_dtype).map_err(Error::Flame)? } else { dw };
-            return x.matmul(&dw).map_err(Error::Flame);
+            // Linear path: factored Kronecker multiply via small matmuls.
+            // This bypasses `get_diff_weight()` entirely — materializing
+            // the full [OUT, IN] Kronecker product was wrong both for
+            // memory (OUT*IN BF16 floats) and for *layout* (it produced
+            // the PyTorch [OUT, IN] order while Rust's matmul expects
+            // [IN, OUT]).  Bug surfaced 2026-05-10 on chroma:
+            //   matmul dimension mismatch: lhs [1024, 3072], rhs [12288, 3072]
+            // (the rhs was kron(w1[16,16], w2[768,192]) = [12288, 3072]
+            //  i.e. [OUT, IN], one transpose away from the right layout
+            //  but already 4× the expected memory).
+            return self.forward_linear_factored(x);
         }
-        // Conv: NHWC with composed kernel
+        // Conv: NHWC with composed kernel.  `get_diff_weight()` returns
+        // [KH,KW,IC,OC] which IS the right layout for `conv2d`, so the
+        // kernel-materialization approach is structurally correct here —
+        // just memory-inefficient when OL*OK or IM*IN are large.
+        // Optimizing the conv path is left for a follow-up; chroma is
+        // pure linear and the linear bug is the only crashing one.
+        let target_dtype = x.dtype();
         let k = self.get_diff_weight()?; // [KH,KW,IC,OC]
         let k = if k.dtype() != target_dtype { k.to_dtype(target_dtype).map_err(Error::Flame)? } else { k };
         crate::ops::conv2d::conv2d(

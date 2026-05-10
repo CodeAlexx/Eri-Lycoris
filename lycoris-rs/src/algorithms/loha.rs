@@ -276,13 +276,23 @@ impl LoHaModule {
     /// Trainable variant of `new_linear` for LoHa with `requires_grad=true`
     /// leaves and storage policy controlled by `dtype`.
     ///
-    /// Init follows LyCORIS canon: `w1a/w2a ~ N(0,1)`, `w1b = 0`,
-    /// `w2b ~ N(0, 0.1)`. Note: unlike LoRA, **`w2b` is *not* zero** at init —
-    /// the initial Hadamard product is `(w1a@0) ⊙ (w2a@small) = 0` (still
-    /// identity at init because `w1b=0` zeros the first branch). The post-init
-    /// adapter delta is therefore zero, but the training-step gradient on
-    /// `w1b` flows through the non-zero `w2`-branch, kicking optimization off
-    /// the saddle.
+    /// Init matches upstream LyCORIS Python (`lycoris/modules/loha.py`,
+    /// `use_scalar=False` default): `hada_w1_a ~ N(0, 0.1)`,
+    /// `hada_w1_b ~ N(0, 1)`, `hada_w2_a = 0`, `hada_w2_b ~ N(0, 1)`. Saved
+    /// names map directly: our `w1a → hada_w1_a`, `w1b → hada_w1_b`,
+    /// `w2a → hada_w2_a`, `w2b → hada_w2_b` (see
+    /// `eridiffusion-core::lycoris::collect_adapter_tensors`).
+    ///
+    /// Identity at init: `(w1a @ w1b) ⊙ (0 @ w2b) = (·) ⊙ 0 = 0`, so the
+    /// adapter delta is exactly zero. Gradient pattern at step 0 (before
+    /// any optimizer update) is **mathematically constrained**: only
+    /// `w2a` (the zero leaf) receives a non-zero gradient — the other
+    /// three are exact zeros because each is multiplied by either the
+    /// upstream zero factor or the saved zero leaf. After step 1 (when
+    /// the optimizer drives `w2a` off zero), all four matrices receive
+    /// non-zero gradients in subsequent steps. This is identical to
+    /// upstream PyTorch LyCORIS behavior; see
+    /// `tests/autograd_smoke.rs::loha_linear_autograd_records_w2a_grad`.
     pub fn new_linear_for_training(
         in_features: usize,
         out_features: usize,
@@ -293,29 +303,33 @@ impl LoHaModule {
     ) -> Result<Self> {
         let alpha = alpha.unwrap_or(rank as f32);
 
+        // Upstream `hada_w1_a ~ N(0, 0.1)` (loha.py line 149).
         let w1a = tensor_utils::randn_param(
             Shape::from_dims(&[in_features, rank]),
             0.0,
-            1.0,
+            0.1,
             dtype,
             device.clone(),
         )?;
-        let w1b = tensor_utils::zeros_param(
+        // Upstream `hada_w1_b ~ N(0, 1)` (loha.py line 148).
+        let w1b = tensor_utils::randn_param(
             Shape::from_dims(&[rank, out_features]),
-            dtype,
-            device.clone(),
-        )?;
-        let w2a = tensor_utils::randn_param(
-            Shape::from_dims(&[in_features, rank]),
             0.0,
             1.0,
             dtype,
             device.clone(),
         )?;
+        // Upstream `hada_w2_a = 0` when use_scalar=False (loha.py line 154).
+        let w2a = tensor_utils::zeros_param(
+            Shape::from_dims(&[in_features, rank]),
+            dtype,
+            device.clone(),
+        )?;
+        // Upstream `hada_w2_b ~ N(0, 1)` (loha.py line 150).
         let w2b = tensor_utils::randn_param(
             Shape::from_dims(&[rank, out_features]),
             0.0,
-            0.1,
+            1.0,
             dtype,
             device.clone(),
         )?;
@@ -335,8 +349,9 @@ impl LoHaModule {
     }
 
     /// Trainable variant of `new_conv2d` for LoHa. See `new_linear_for_training`
-    /// for grad / dtype semantics; same init pattern with `w2b ~ N(0, 0.1)` and
-    /// (when Tucker enabled) `t1, t2 ~ N(0, 0.1)`.
+    /// for grad / dtype semantics. Init matches upstream LyCORIS Python
+    /// (`lycoris/modules/loha.py`): `w1a ~ N(0, 0.1)`, `w1b ~ N(0, 1)`,
+    /// `w2a = 0`, `w2b ~ N(0, 1)`; `t1, t2 ~ N(0, 0.1)` when Tucker is enabled.
     #[allow(clippy::too_many_arguments)]
     pub fn new_conv2d_for_training(
         in_channels: usize,
@@ -354,37 +369,37 @@ impl LoHaModule {
         let (w1a, w1b, w2a, w2b, t1, t2) = if kh == 1 && kw == 1 {
             let w1a = tensor_utils::randn_param(
                 Shape::from_dims(&[1, 1, in_channels, rank]),
-                0.0, 1.0, dtype, device.clone(),
+                0.0, 0.1, dtype, device.clone(),
             )?;
-            let w1b = tensor_utils::zeros_param(
+            let w1b = tensor_utils::randn_param(
                 Shape::from_dims(&[1, 1, rank, out_channels]),
-                dtype, device.clone(),
-            )?;
-            let w2a = tensor_utils::randn_param(
-                Shape::from_dims(&[1, 1, in_channels, rank]),
                 0.0, 1.0, dtype, device.clone(),
+            )?;
+            let w2a = tensor_utils::zeros_param(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
+                dtype, device.clone(),
             )?;
             let w2b = tensor_utils::randn_param(
                 Shape::from_dims(&[1, 1, rank, out_channels]),
-                0.0, 0.1, dtype, device.clone(),
+                0.0, 1.0, dtype, device.clone(),
             )?;
             (w1a, w1b, w2a, w2b, None, None)
         } else if use_tucker {
             let w1a = tensor_utils::randn_param(
                 Shape::from_dims(&[1, 1, in_channels, rank]),
-                0.0, 1.0, dtype, device.clone(),
+                0.0, 0.1, dtype, device.clone(),
             )?;
-            let w1b = tensor_utils::zeros_param(
+            let w1b = tensor_utils::randn_param(
                 Shape::from_dims(&[1, 1, rank, out_channels]),
-                dtype, device.clone(),
-            )?;
-            let w2a = tensor_utils::randn_param(
-                Shape::from_dims(&[1, 1, in_channels, rank]),
                 0.0, 1.0, dtype, device.clone(),
+            )?;
+            let w2a = tensor_utils::zeros_param(
+                Shape::from_dims(&[1, 1, in_channels, rank]),
+                dtype, device.clone(),
             )?;
             let w2b = tensor_utils::randn_param(
                 Shape::from_dims(&[1, 1, rank, out_channels]),
-                0.0, 0.1, dtype, device.clone(),
+                0.0, 1.0, dtype, device.clone(),
             )?;
             let t1 = tensor_utils::randn_param(
                 Shape::from_dims(&[kh, kw, rank, rank]),
@@ -398,19 +413,19 @@ impl LoHaModule {
         } else {
             let w1a = tensor_utils::randn_param(
                 Shape::from_dims(&[kh, kw, in_channels, rank]),
-                0.0, 1.0, dtype, device.clone(),
+                0.0, 0.1, dtype, device.clone(),
             )?;
-            let w1b = tensor_utils::zeros_param(
+            let w1b = tensor_utils::randn_param(
                 Shape::from_dims(&[kh, kw, rank, out_channels]),
-                dtype, device.clone(),
-            )?;
-            let w2a = tensor_utils::randn_param(
-                Shape::from_dims(&[kh, kw, in_channels, rank]),
                 0.0, 1.0, dtype, device.clone(),
+            )?;
+            let w2a = tensor_utils::zeros_param(
+                Shape::from_dims(&[kh, kw, in_channels, rank]),
+                dtype, device.clone(),
             )?;
             let w2b = tensor_utils::randn_param(
                 Shape::from_dims(&[kh, kw, rank, out_channels]),
-                0.0, 0.1, dtype, device.clone(),
+                0.0, 1.0, dtype, device.clone(),
             )?;
             (w1a, w1b, w2a, w2b, None, None)
         };
