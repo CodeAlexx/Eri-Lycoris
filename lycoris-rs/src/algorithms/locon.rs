@@ -7,7 +7,7 @@
 /// - Linear: [IN, OUT]
 /// - Conv2d: [KH, KW, IC, OC]
 
-use crate::{tensor_utils, Error, LycorisModule, Result, StorageDtype};
+use crate::{tensor_utils, tensor_utils::LoraInitType, Error, LycorisModule, Result, StorageDtype};
 use cudarc::driver::CudaDevice;
 use flame_core::parameter::Parameter;
 use flame_core::{DType, Shape, Tensor};
@@ -230,12 +230,59 @@ impl LoConModule {
         device: Arc<CudaDevice>,
         dtype: StorageDtype,
     ) -> Result<Self> {
+        Self::new_linear_for_training_with_init(
+            in_features,
+            out_features,
+            rank,
+            alpha,
+            device,
+            dtype,
+            LoraInitType::Default,
+        )
+    }
+
+    /// Variant of `new_linear_for_training` that selects the LoRA init scheme
+    /// (PEFT / SimpleTuner `lora_init_type` parity).
+    ///
+    /// `LoraInitType::Default` = `down ~ N(0, 1)` (preserves prior behavior).
+    /// `LoraInitType::Gaussian` = `down ~ N(0, 1/rank)` (PEFT gaussian).
+    /// `Pissa` / `Olora` / `Loftq` error — they need SVD/QR of the base
+    /// weight, which flame-core does not yet expose.
+    pub fn new_linear_for_training_with_init(
+        in_features: usize,
+        out_features: usize,
+        rank: usize,
+        alpha: Option<f32>,
+        device: Arc<CudaDevice>,
+        dtype: StorageDtype,
+        init_type: LoraInitType,
+    ) -> Result<Self> {
         let alpha = alpha.unwrap_or(rank as f32);
+
+        let down_std = match init_type {
+            LoraInitType::Default => 1.0,
+            LoraInitType::Gaussian => {
+                if rank == 0 {
+                    return Err(Error::InvalidOperation(
+                        "LoCon::new_linear_for_training_with_init: gaussian init requires rank > 0".into(),
+                    ));
+                }
+                1.0 / rank as f32
+            }
+            LoraInitType::Pissa | LoraInitType::Olora | LoraInitType::Loftq => {
+                return Err(Error::InvalidOperation(format!(
+                    "LoCon::new_linear_for_training_with_init: lora_init_type '{}' \
+                     requires SVD/QR of the base weight, which flame-core does not \
+                     yet expose. Choose 'default' or 'gaussian'.",
+                    init_type.as_str()
+                )));
+            }
+        };
 
         let down = tensor_utils::randn_param(
             Shape::from_dims(&[in_features, rank]),
             0.0,
-            1.0,
+            down_std,
             dtype,
             device.clone(),
         )?;
@@ -271,14 +318,64 @@ impl LoConModule {
         device: Arc<CudaDevice>,
         dtype: StorageDtype,
     ) -> Result<Self> {
+        Self::new_conv2d_for_training_with_init(
+            in_channels,
+            out_channels,
+            kernel_size,
+            rank,
+            alpha,
+            use_tucker,
+            device,
+            dtype,
+            LoraInitType::Default,
+        )
+    }
+
+    /// Variant of `new_conv2d_for_training` that selects the LoRA init
+    /// scheme. See `new_linear_for_training_with_init` for semantics. Conv
+    /// `mid` (Tucker) factor is always init'd at `N(0, 1)` regardless of
+    /// `init_type`; it sits between two LoRA-style factors and inherits the
+    /// upstream-LyCORIS Tucker convention.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_conv2d_for_training_with_init(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize),
+        rank: usize,
+        alpha: Option<f32>,
+        use_tucker: bool,
+        device: Arc<CudaDevice>,
+        dtype: StorageDtype,
+        init_type: LoraInitType,
+    ) -> Result<Self> {
         let alpha = alpha.unwrap_or(rank as f32);
         let (kh, kw) = kernel_size;
+
+        let down_std = match init_type {
+            LoraInitType::Default => 1.0,
+            LoraInitType::Gaussian => {
+                if rank == 0 {
+                    return Err(Error::InvalidOperation(
+                        "LoCon::new_conv2d_for_training_with_init: gaussian init requires rank > 0".into(),
+                    ));
+                }
+                1.0 / rank as f32
+            }
+            LoraInitType::Pissa | LoraInitType::Olora | LoraInitType::Loftq => {
+                return Err(Error::InvalidOperation(format!(
+                    "LoCon::new_conv2d_for_training_with_init: lora_init_type '{}' \
+                     requires SVD/QR of the base weight, which flame-core does not \
+                     yet expose. Choose 'default' or 'gaussian'.",
+                    init_type.as_str()
+                )));
+            }
+        };
 
         let (down, up, mid) = if kh == 1 && kw == 1 {
             let down = tensor_utils::randn_param(
                 Shape::from_dims(&[1, 1, in_channels, rank]),
                 0.0,
-                1.0,
+                down_std,
                 dtype,
                 device.clone(),
             )?;
@@ -292,7 +389,7 @@ impl LoConModule {
             let down = tensor_utils::randn_param(
                 Shape::from_dims(&[1, 1, in_channels, rank]),
                 0.0,
-                1.0,
+                down_std,
                 dtype,
                 device.clone(),
             )?;
@@ -313,7 +410,7 @@ impl LoConModule {
             let down = tensor_utils::randn_param(
                 Shape::from_dims(&[kh, kw, in_channels, rank]),
                 0.0,
-                1.0,
+                down_std,
                 dtype,
                 device.clone(),
             )?;

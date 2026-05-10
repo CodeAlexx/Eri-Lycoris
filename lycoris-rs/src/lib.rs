@@ -21,7 +21,7 @@ pub mod loader;
 pub use error::{Error, Result};
 pub use dtype::DType;
 pub use layout::{TensorLayout, LayoutConverter};
-pub use tensor_utils::StorageDtype;
+pub use tensor_utils::{LoraInitType, StorageDtype};
 
 // Re-export core Flame types
 pub use flame_core::{Tensor, Shape, Device};

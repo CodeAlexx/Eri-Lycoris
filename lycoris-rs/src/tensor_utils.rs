@@ -47,6 +47,78 @@ impl Default for StorageDtype {
     }
 }
 
+/// LoRA-style initialization scheme for the "down" / `_a` factor.
+///
+/// PEFT / SimpleTuner lora_init_type parity. Applies to LoCon (the canonical
+/// LoRA decomposition); other LyCORIS algos (LoHa / LoKr / Full / OFT / BOFT)
+/// retain their algorithm-specific upstream init regardless of this setting.
+///
+/// | Variant   | Down init                       | Up init |
+/// | --------- | ------------------------------- | ------- |
+/// | `Default` | `N(0, 1)` (current Phase-2b)    | zeros   |
+/// | `Gaussian`| `N(0, 1/rank)` (PEFT gaussian)  | zeros   |
+/// | `Pissa`   | SVD-of-base-weight (UNSUPPORTED — flame-core lacks SVD) |
+/// | `Olora`   | QR-of-base-weight (UNSUPPORTED — flame-core lacks QR)   |
+/// | `Loftq`   | quant-aware SVD (UNSUPPORTED — flame-core lacks SVD)    |
+///
+/// `Pissa`/`Olora`/`Loftq` parse and round-trip cleanly so config files can
+/// carry them, but adapter construction errors with a clear "needs flame-core
+/// linalg" message — see `LoConModule::new_linear_for_training_with_init`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoraInitType {
+    Default,
+    Gaussian,
+    Pissa,
+    Olora,
+    Loftq,
+}
+
+impl Default for LoraInitType {
+    fn default() -> Self {
+        LoraInitType::Default
+    }
+}
+
+impl LoraInitType {
+    /// Parse from string (case-insensitive). Matches SimpleTuner's
+    /// `--lora_init_type` choices: `default | gaussian | pissa | olora | loftq`.
+    /// Empty / `"none"` map to `Default`.
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        let lower = s.trim().to_ascii_lowercase();
+        Ok(match lower.as_str() {
+            "" | "default" | "none" => LoraInitType::Default,
+            "gaussian" => LoraInitType::Gaussian,
+            "pissa" => LoraInitType::Pissa,
+            "olora" => LoraInitType::Olora,
+            "loftq" => LoraInitType::Loftq,
+            other => {
+                return Err(format!(
+                    "unknown lora_init_type '{other}'; expected one of: \
+                     default, gaussian, pissa, olora, loftq"
+                ))
+            }
+        })
+    }
+
+    /// Stable string identifier (matches `parse` lowercase form).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LoraInitType::Default => "default",
+            LoraInitType::Gaussian => "gaussian",
+            LoraInitType::Pissa => "pissa",
+            LoraInitType::Olora => "olora",
+            LoraInitType::Loftq => "loftq",
+        }
+    }
+
+    /// Returns `true` when adapter construction with this init can succeed
+    /// without external linalg (SVD/QR). Used by ctors to short-circuit
+    /// before allocating tensors.
+    pub fn is_supported(&self) -> bool {
+        matches!(self, LoraInitType::Default | LoraInitType::Gaussian)
+    }
+}
+
 /// Create a random tensor with BF16 dtype (inference / non-training).
 ///
 /// Returned tensor has `requires_grad=false`. Use `randn_bf16_param` for
