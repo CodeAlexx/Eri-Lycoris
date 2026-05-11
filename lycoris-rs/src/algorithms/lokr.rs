@@ -810,6 +810,103 @@ impl LoKrModule {
         w2.set_data(new_w2).map_err(Error::Flame)?;
         Ok(())
     }
+
+    /// Dead-leaf-break init for **factored W2** LoKr (when
+    /// `rank < max(out_k, in_n)/2`).
+    ///
+    /// Default factored init zeros `w2_b` → only `w2_b` receives grad at
+    /// step 0, leaving `w1` and `w2_a` frozen. With AdamW this self-resolves
+    /// in 1-2 steps; with RAdam/ScheduleFree (warmup + EMA averaging) it
+    /// takes hundreds of steps and the LoRA effectively doesn't learn.
+    ///
+    /// Fix: replace `w2_b`'s zeros with a small N(0, σ) tensor scaled so the
+    /// reconstructed `w2 = w2_a @ w2_b` matches the statistical envelope used
+    /// by the full-W2 `init_perturbed_normal` path (`scale · N(μ_base, σ_base)`).
+    ///
+    /// `w1` is left at its kaiming-uniform init (nonzero, gradient flows).
+    /// `w2_a` is left at kaiming-uniform (nonzero, gradient flows once `w2_b ≠ 0`).
+    ///
+    /// Returns `Err` if the LoKr is in full-W2 mode (caller should use
+    /// `init_perturbed_normal` instead) or in factored-W1 mode (unsupported here).
+    pub fn init_perturbed_normal_factored(
+        &self,
+        base_weight: &Tensor,
+        scale: f32,
+    ) -> Result<()> {
+        if self.w1.is_none() {
+            return Err(Error::InvalidOperation(
+                "init_perturbed_normal_factored: factored W1 (decompose_both=true) \
+                 is not supported — use full-W1 LoKr or call init_perturbed_normal \
+                 on a full-form bundle.".into(),
+            ));
+        }
+        let w2a = self.w2a.as_ref().ok_or_else(|| {
+            Error::InvalidOperation(
+                "init_perturbed_normal_factored: w2_a missing — not a factored LoKr.".into()
+            )
+        })?;
+        let w2b = self.w2b.as_ref().ok_or_else(|| {
+            Error::InvalidOperation(
+                "init_perturbed_normal_factored: w2_b missing — not a factored LoKr.".into()
+            )
+        })?;
+
+        // Base-weight stats (host-side, one-shot at init).
+        let bw_f32 = base_weight.to_dtype(DType::F32).map_err(Error::Flame)?;
+        let bw_vec = bw_f32.to_vec().map_err(Error::Flame)?;
+        if bw_vec.is_empty() {
+            return Err(Error::InvalidOperation(
+                "init_perturbed_normal_factored: base_weight is empty".into(),
+            ));
+        }
+        let n = bw_vec.len() as f32;
+        let bw_mean = bw_vec.iter().sum::<f32>() / n;
+        let bw_var = bw_vec.iter().map(|v| (v - bw_mean).powi(2)).sum::<f32>() / n;
+        let bw_std = bw_var.sqrt();
+
+        // w2_a is kaiming-uniform with effective stddev σ_a ≈ √(1/in_k) (kaiming a=√5).
+        // We want the product w2_a @ w2_b to have stddev ≈ bw_std · scale.
+        // For w2_b ~ N(0, σ_b) independent of w2_a, the product's elementwise
+        // stddev is √(r) · σ_a · σ_b (sum of r independent products).
+        // → σ_b = (bw_std · scale) / (√r · σ_a)
+        let w2b_t = w2b.tensor().map_err(Error::Flame)?;
+        let w2b_dims = w2b_t.dims().to_vec();
+        let w2b_dtype = w2b_t.dtype();
+        let r = w2b_dims[0] as f32;
+        let w2a_t = w2a.tensor().map_err(Error::Flame)?;
+        let in_k = *w2a_t.dims().last().unwrap_or(&1) as f32;
+        // Kaiming-uniform with a=√5 has var = 2/((1+5) * fan_in) = 1/(3*fan_in)
+        let sigma_a = (1.0_f32 / (3.0 * in_k.max(1.0))).sqrt();
+        let sigma_b = (bw_std * scale) / ((r.max(1.0)).sqrt() * sigma_a.max(1e-12));
+
+        // Draw randn shaped like w2_b, scale by sigma_b.
+        let randn = Tensor::randn(
+            Shape::from_dims(&w2b_dims),
+            0.0,
+            1.0,
+            self.device.clone(),
+        )
+        .map_err(Error::Flame)?;
+        let randn_f32 = randn.to_dtype(DType::F32).map_err(Error::Flame)?;
+        let randn_vec = randn_f32.to_vec().map_err(Error::Flame)?;
+        let v_scaled: Vec<f32> = randn_vec.iter().map(|x| x * sigma_b + bw_mean / r.max(1.0))
+            .collect();
+
+        let new_w2b_f32 = Tensor::from_vec_dtype(
+            v_scaled,
+            Shape::from_dims(&w2b_dims),
+            self.device.clone(),
+            DType::F32,
+        ).map_err(Error::Flame)?;
+        let new_w2b = if w2b_dtype != DType::F32 {
+            new_w2b_f32.to_dtype(w2b_dtype).map_err(Error::Flame)?
+        } else {
+            new_w2b_f32
+        }
+        .requires_grad_(true);
+        w2b.set_data(new_w2b).map_err(Error::Flame)?;
+        Ok(())
+    }
 }
 
 impl LycorisModule for LoKrModule {

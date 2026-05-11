@@ -5,6 +5,33 @@ Complete rewrite of all 6 core files to comply with Flame framework contracts, e
 
 ---
 
+## 2026-05-11: Factored-LoKr dead-leaf-break init
+
+### `LoKrModule::init_perturbed_normal_factored(base_weight, scale)`
+Break the dead-leaf at step 0 for factored-W2 LoKr
+(`rank < max(out_k, in_n)/2`). Default factored init zeros `w2_b`, so at
+step 0 only `w2_b` receives gradient — `w1` and `w2_a` stay frozen until
+`w2_b` accumulates enough nonzero values to unblock them.
+
+With **AdamW** the dead-leaf self-resolves in 1-2 steps. With
+**RAdam/ScheduleFree** optimizers (warmup damping + EMA averaging) it takes
+hundreds of steps and the LoRA effectively doesn't learn within a normal
+fine-tune budget. Symptom: loss plateaus near initial value, samples look
+identical to the base model.
+
+**Fix**: replace `w2_b` zeros with `N(0, σ_b)` where σ_b is chosen so the
+product `w2_a @ w2_b` has elementwise stddev ≈ `bw_std · scale` (matches the
+full-W2 `init_perturbed_normal` envelope).
+
+`w1` and `w2_a` are left at their kaiming-uniform init. Errors only on
+factored-W1 LoKr (`decompose_both=true`) which is structurally different.
+
+Caller-side dispatch (in `eridiffusion-core::adapter`): `init_perturbed_normal_lokr`
+tries full-W2 first; on `"requires full W2"` error, falls back to the
+factored variant. Both paths return `Ok(true)` when applied.
+
+---
+
 ## Latest Updates (Conv-Aware Operations)
 
 ### New Module: ops/conv2d.rs
